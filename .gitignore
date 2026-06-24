@@ -5,3 +5,5 @@ DerivedData/
 *.xcworkspace
 Derived/
 .tuist-derived/
+.host-runner/
+HelloWorld/
