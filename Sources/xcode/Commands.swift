@@ -21,9 +21,17 @@ let commandRegistry: [CommandSpec] = [
                 flags: ["--template", "--platform", "--bundle-id", "--no-generate", "--json"]),
     CommandSpec(name: "build", summary: "Build the project in the current directory",
                 usage: "xcode build [extra tool args]", flags: ["--json"]),
-    CommandSpec(name: "run", summary: "Build and run a Swift package or app on simulator",
-                usage: "xcode run [--simulator <name|udid>] [--scheme <name>] [--bundle-id <id>] [extra xcodebuild args]",
-                flags: ["--simulator", "--scheme", "--bundle-id", "--json"]),
+    CommandSpec(name: "run", summary: "Build and run an app on simulator or physical device",
+                usage: "xcode run [--simulator <name|udid>] [--device <name|udid>] [--scheme <name>] [--bundle-id <id>] [extra xcodebuild args]",
+                flags: ["--simulator", "--device", "--scheme", "--bundle-id", "--json"]),
+    CommandSpec(name: "devices", summary: "List connected physical devices",
+                usage: "xcode devices", flags: ["--json"]),
+    CommandSpec(name: "clean", summary: "Clean build artifacts for the project in the current directory",
+                usage: "xcode clean", flags: ["--json"]),
+    CommandSpec(name: "open", summary: "Open the project in Xcode",
+                usage: "xcode open", flags: []),
+    CommandSpec(name: "lint", summary: "Run SwiftLint on the project (requires swiftlint on PATH)",
+                usage: "xcode lint [extra swiftlint args]", flags: ["--json"]),
     CommandSpec(name: "test", summary: "Run tests and report a summary",
                 usage: "xcode test [extra tool args]", flags: ["--json"]),
     CommandSpec(name: "simulator", summary: "Manage simulators (list/boot/shutdown)",
@@ -357,6 +365,7 @@ enum TestCommand {
 enum RunCommand {
     static func run(_ args: [String], _ ctx: Context) {
         var simulatorTarget: String?
+        var deviceTarget: String?
         var scheme: String?
         var bundleId: String?
         var extraArgs: [String] = []
@@ -365,6 +374,7 @@ enum RunCommand {
         while idx < args.count {
             switch args[idx] {
             case "--simulator": idx += 1; if idx < args.count { simulatorTarget = args[idx] }
+            case "--device":    idx += 1; if idx < args.count { deviceTarget = args[idx] }
             case "--scheme":    idx += 1; if idx < args.count { scheme = args[idx] }
             case "--bundle-id": idx += 1; if idx < args.count { bundleId = args[idx] }
             default: extraArgs.append(args[idx])
@@ -379,8 +389,13 @@ enum RunCommand {
                                args: ["swift", "run"] + extraArgs, ctx)
         case .tuist, .xcworkspace, .xcodeproj:
             requireFullXcode("run", ctx)
-            runAppOnSimulator(project: project, simulatorTarget: simulatorTarget,
-                              scheme: scheme, bundleId: bundleId, extraArgs: extraArgs, ctx)
+            if let device = deviceTarget {
+                runAppOnDevice(project: project, deviceTarget: device,
+                               scheme: scheme, bundleId: bundleId, extraArgs: extraArgs, ctx)
+            } else {
+                runAppOnSimulator(project: project, simulatorTarget: simulatorTarget,
+                                  scheme: scheme, bundleId: bundleId, extraArgs: extraArgs, ctx)
+            }
         case .none:
             Out.fail("run", error: "no project found in current directory",
                      hint: "run `xcode create <Name>`", code: ExitCode.usage, ctx)
@@ -559,6 +574,255 @@ enum RunCommand {
         Out.fail("run", error: "no iOS simulator available",
                  hint: "install a simulator runtime in Xcode Settings → Platforms",
                  code: ExitCode.envNotReady, ctx)
+    }
+
+    // MARK: Physical device
+
+    static func runAppOnDevice(project: ProjectKind, deviceTarget: String,
+                                scheme: String?, bundleId: String?,
+                                extraArgs: [String], _ ctx: Context) -> Never {
+        let schemeName: String
+        if let s = scheme {
+            schemeName = s
+        } else if let inferred = inferScheme() {
+            schemeName = inferred
+        } else {
+            Out.fail("run", error: "could not infer scheme — pass --scheme <name>",
+                     hint: "run `xcrun xcodebuild -list` to see available schemes",
+                     code: ExitCode.runtime, ctx)
+        }
+
+        let projectFlag: [String]
+        switch project {
+        case .xcworkspace(let path): projectFlag = ["-workspace", path]
+        case .xcodeproj(let path):  projectFlag = ["-project", path]
+        case .tuist:
+            guard let ws = findWorkspaceInCwd() else {
+                Out.fail("run", error: "no .xcworkspace found — run `tuist generate` first",
+                         code: ExitCode.runtime, ctx)
+            }
+            projectFlag = ["-workspace", ws]
+        default:
+            Out.fail("run", error: "unexpected project type", code: ExitCode.runtime, ctx)
+        }
+
+        let derivedDataPath = "/tmp/xcode-agent-device-\(schemeName)"
+        let buildArgs = projectFlag + [
+            "-scheme", schemeName,
+            "-sdk", "iphoneos",
+            "-configuration", "Debug",
+            "-derivedDataPath", derivedDataPath,
+            "-allowProvisioningUpdates",
+        ] + extraArgs + ["build"]
+
+        Out.stderr("Building '\(schemeName)' for iphoneos…")
+        let buildResult = Shell.run("/usr/bin/xcrun", ["xcodebuild"] + buildArgs)
+        guard buildResult.exitCode == 0 else {
+            if !buildResult.stderr.isEmpty { Out.stderr(buildResult.stderr) }
+            Out.fail("run", error: "build failed (exit \(buildResult.exitCode))",
+                     hint: "ensure the scheme has a signing team set, or pass -allowProvisioningUpdates",
+                     code: ExitCode.runtime, ctx)
+        }
+
+        // Find the .app under Build/Products/Debug-iphoneos/
+        let searchBase = derivedDataPath + "/Build/Products"
+        let fm = FileManager.default
+        var appPath: String?
+        if let configs = try? fm.contentsOfDirectory(atPath: searchBase) {
+            for config in configs.sorted().reversed() where config.contains("iphoneos") {
+                let configPath = searchBase + "/" + config
+                if let apps = try? fm.contentsOfDirectory(atPath: configPath),
+                   let app = apps.first(where: { $0.hasSuffix(".app") }) {
+                    appPath = configPath + "/" + app; break
+                }
+            }
+        }
+        guard let app = appPath else {
+            Out.fail("run", error: "could not locate .app under \(searchBase)",
+                     hint: "verify the scheme builds an app target for iphoneos",
+                     code: ExitCode.runtime, ctx)
+        }
+
+        let bid = bundleId ?? readBundleId(from: app)
+        guard let finalBid = bid else {
+            Out.fail("run", error: "could not read CFBundleIdentifier from \(app)/Info.plist",
+                     hint: "pass --bundle-id <id> explicitly", code: ExitCode.runtime, ctx)
+        }
+
+        let deviceUDID = findDevice(target: deviceTarget, ctx)
+
+        Out.stderr("Installing on device \(deviceUDID)…")
+        let installResult = Shell.run("/usr/bin/xcrun",
+            ["devicectl", "device", "install", "app", "--device", deviceUDID, app])
+        guard installResult.exitCode == 0 else {
+            Out.fail("run",
+                     error: "devicectl install failed: \(installResult.stderr.trimmingCharacters(in: .whitespacesAndNewlines))",
+                     code: ExitCode.runtime, ctx)
+        }
+
+        Out.stderr("Launching \(finalBid)…")
+        let launchResult = Shell.run("/usr/bin/xcrun",
+            ["devicectl", "device", "process", "launch",
+             "--terminate-existing", "--device", deviceUDID, finalBid])
+        let ok = launchResult.exitCode == 0
+        let pid = launchResult.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        let data: [String: Any] = [
+            "scheme": schemeName, "appPath": app,
+            "bundleId": finalBid, "deviceUDID": deviceUDID, "pid": pid,
+        ]
+        Out.success("run", data: data, human: """
+            Launched '\(schemeName)' on device \(deviceUDID)
+              bundle id : \(finalBid)
+              pid       : \(pid.isEmpty ? "(unknown)" : pid)
+            """, ctx)
+        exit(ok ? ExitCode.ok : ExitCode.runtime)
+    }
+
+    /// Returns a device UDID matching the given name or UDID string, or exits with an error.
+    static func findDevice(target: String, _ ctx: Context) -> String {
+        let tmpPath = "/tmp/xcode-agent-devices.json"
+        let result = Shell.run("/usr/bin/xcrun",
+            ["devicectl", "device", "list", "--json-output", tmpPath])
+        guard result.exitCode == 0,
+              let data = FileManager.default.contents(atPath: tmpPath),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let deviceList = (json["result"] as? [String: Any])?["devices"] as? [[String: Any]]
+        else {
+            Out.fail("run", error: "could not list devices — is a device connected?",
+                     hint: "connect your iPhone and trust this Mac, then retry",
+                     code: ExitCode.envNotReady, ctx)
+        }
+        try? FileManager.default.removeItem(atPath: tmpPath)
+
+        if let device = deviceList.first(where: {
+            ($0["udid"] as? String) == target ||
+            ($0["deviceProperties"] as? [String: Any])?["name"] as? String == target
+        }), let udid = device["udid"] as? String {
+            return udid
+        }
+
+        Out.fail("run", error: "device not found: '\(target)'",
+                 hint: "run `xcode devices` to list connected devices",
+                 code: ExitCode.runtime, ctx)
+    }
+}
+
+// MARK: - devices
+
+enum DevicesCommand {
+    static func run(_ args: [String], _ ctx: Context) {
+        requireFullXcode("devices", ctx)
+        let tmpPath = "/tmp/xcode-agent-devices.json"
+        let result = Shell.run("/usr/bin/xcrun",
+            ["devicectl", "device", "list", "--json-output", tmpPath])
+        guard result.exitCode == 0,
+              let data = FileManager.default.contents(atPath: tmpPath),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let deviceList = (json["result"] as? [String: Any])?["devices"] as? [[String: Any]]
+        else {
+            if ctx.json {
+                Out.printJSON(["ok": false, "command": "devices",
+                               "data": ["devices": []],
+                               "error": "no devices found — connect an iPhone and trust this Mac",
+                               "hint": NSNull()])
+            } else {
+                print("No devices found. Connect an iPhone/iPad and trust this Mac.")
+            }
+            try? FileManager.default.removeItem(atPath: tmpPath)
+            exit(ExitCode.ok)
+        }
+        try? FileManager.default.removeItem(atPath: tmpPath)
+
+        let devices: [[String: Any]] = deviceList.compactMap { d in
+            guard let udid = d["udid"] as? String,
+                  let props = d["deviceProperties"] as? [String: Any],
+                  let name = props["name"] as? String else { return nil }
+            let os = (d["hardwareProperties"] as? [String: Any])?["cpuType"] as? String ?? ""
+            let osVersion = props["osVersionNumber"] as? String ?? ""
+            return ["udid": udid, "name": name, "osVersion": osVersion, "cpuType": os]
+        }
+
+        if ctx.json {
+            Out.printJSON(["ok": true, "command": "devices",
+                           "data": ["devices": devices],
+                           "error": NSNull(), "hint": NSNull()])
+        } else {
+            if devices.isEmpty {
+                print("No devices found. Connect an iPhone/iPad and trust this Mac.")
+            } else {
+                print("Connected devices:")
+                for d in devices {
+                    let name = d["name"] as? String ?? ""
+                    let udid = d["udid"] as? String ?? ""
+                    let os   = d["osVersion"] as? String ?? ""
+                    print("  \(name) (\(os))  \(udid)")
+                }
+            }
+        }
+        exit(ExitCode.ok)
+    }
+}
+
+// MARK: - clean
+
+enum CleanCommand {
+    static func run(_ args: [String], _ ctx: Context) {
+        switch Project.detect() {
+        case .tuist:
+            let tuist = requireTuist("clean", ctx)
+            runToolWithSummary(command: "clean", tool: tuist, args: ["clean"], ctx)
+        case .xcworkspace(let path):
+            requireFullXcode("clean", ctx)
+            runToolWithSummary(command: "clean", tool: "/usr/bin/xcrun",
+                               args: ["xcodebuild", "-workspace", path, "clean"], ctx)
+        case .xcodeproj(let path):
+            requireFullXcode("clean", ctx)
+            runToolWithSummary(command: "clean", tool: "/usr/bin/xcrun",
+                               args: ["xcodebuild", "-project", path, "clean"], ctx)
+        case .package:
+            runToolWithSummary(command: "clean", tool: "/usr/bin/xcrun",
+                               args: ["swift", "package", "clean"], ctx)
+        case .none:
+            Out.fail("clean", error: "no project found in current directory",
+                     hint: "cd into a project directory", code: ExitCode.usage, ctx)
+        }
+    }
+}
+
+// MARK: - open
+
+enum OpenCommand {
+    static func run(_ args: [String], _ ctx: Context) {
+        let cwd = FileManager.default.currentDirectoryPath
+        let fm  = FileManager.default
+
+        // Prefer workspace (Tuist / CocoaPods generate one)
+        if let entries = try? fm.contentsOfDirectory(atPath: cwd) {
+            if let ws = entries.first(where: { $0.hasSuffix(".xcworkspace") }) {
+                exit(Shell.runStreaming("/usr/bin/open", [cwd + "/" + ws]))
+            }
+            if let proj = entries.first(where: { $0.hasSuffix(".xcodeproj") }) {
+                exit(Shell.runStreaming("/usr/bin/open", [cwd + "/" + proj]))
+            }
+        }
+        if fm.fileExists(atPath: cwd + "/Package.swift") {
+            exit(Shell.runStreaming("/usr/bin/open", [cwd + "/Package.swift"]))
+        }
+        Out.fail("open", error: "no Xcode project found in current directory",
+                 hint: "cd into a project or run `xcode create <Name>`", code: ExitCode.usage, ctx)
+    }
+}
+
+// MARK: - lint
+
+enum LintCommand {
+    static func run(_ args: [String], _ ctx: Context) {
+        guard let swiftlint = Toolchain.which("swiftlint") else {
+            Out.fail("lint", error: "swiftlint not found on PATH",
+                     hint: "install: brew install swiftlint", code: ExitCode.toolNotFound, ctx)
+        }
+        runToolWithSummary(command: "lint", tool: swiftlint, args: args, ctx)
     }
 }
 
