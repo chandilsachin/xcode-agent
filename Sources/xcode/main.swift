@@ -18,7 +18,7 @@ func printRootHelp() {
     print("""
     xcode-agent \(version) — an agent-friendly CLI for Xcode/iOS development
 
-    usage: xcode <command> [options] [--json]
+    usage: xcode-agent <command> [options] [--json]
 
     commands:
     """)
@@ -30,7 +30,7 @@ func printRootHelp() {
     global flags:
       --json   emit a single JSON object on stdout (logs go to stderr)
 
-    run `xcode commands --json` for machine-readable command metadata.
+    run `xcode-agent commands --json` for machine-readable command metadata.
     """)
 }
 

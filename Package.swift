@@ -5,7 +5,7 @@ let package = Package(
     name: "xcode-agent",
     platforms: [.macOS(.v12)],
     products: [
-        .executable(name: "xcode", targets: ["xcode"])
+        .executable(name: "xcode-agent", targets: ["xcode"])
     ],
     targets: [
         .executableTarget(

@@ -1,6 +1,6 @@
 import Foundation
 
-// MARK: - Command registry (powers `xcode commands` introspection)
+// MARK: - Command registry (powers `xcode-agent commands` introspection)
 
 struct CommandSpec {
     let name: String
@@ -11,41 +11,41 @@ struct CommandSpec {
 
 let commandRegistry: [CommandSpec] = [
     CommandSpec(name: "doctor", summary: "Check toolchain readiness with remediation hints",
-                usage: "xcode doctor", flags: ["--json"]),
+                usage: "xcode-agent doctor", flags: ["--json"]),
     CommandSpec(name: "info", summary: "Show active toolchain versions",
-                usage: "xcode info", flags: ["--json"]),
+                usage: "xcode-agent info", flags: ["--json"]),
     CommandSpec(name: "commands", summary: "List all commands (self-describing)",
-                usage: "xcode commands", flags: ["--json"]),
+                usage: "xcode-agent commands", flags: ["--json"]),
     CommandSpec(name: "create", summary: "Scaffold a new project and generate it with Tuist",
-                usage: "xcode create <Name> [--template app|package] [--platform ios|macos] [--bundle-id <id>] [--no-generate]",
+                usage: "xcode-agent create <Name> [--template app|package] [--platform ios|macos] [--bundle-id <id>] [--no-generate]",
                 flags: ["--template", "--platform", "--bundle-id", "--no-generate", "--json"]),
     CommandSpec(name: "build", summary: "Build the project in the current directory",
-                usage: "xcode build [extra tool args]", flags: ["--json"]),
+                usage: "xcode-agent build [extra tool args]", flags: ["--json"]),
     CommandSpec(name: "run", summary: "Build and run an app on simulator or physical device",
-                usage: "xcode run [--simulator <name|udid>] [--device <name|udid>] [--scheme <name>] [--bundle-id <id>] [extra xcodebuild args]",
+                usage: "xcode-agent run [--simulator <name|udid>] [--device <name|udid>] [--scheme <name>] [--bundle-id <id>] [extra xcodebuild args]",
                 flags: ["--simulator", "--device", "--scheme", "--bundle-id", "--json"]),
     CommandSpec(name: "devices", summary: "List connected physical devices",
-                usage: "xcode devices", flags: ["--json"]),
+                usage: "xcode-agent devices", flags: ["--json"]),
     CommandSpec(name: "clean", summary: "Clean build artifacts for the project in the current directory",
-                usage: "xcode clean", flags: ["--json"]),
+                usage: "xcode-agent clean", flags: ["--json"]),
     CommandSpec(name: "open", summary: "Open the project in Xcode",
-                usage: "xcode open", flags: []),
+                usage: "xcode-agent open", flags: []),
     CommandSpec(name: "lint", summary: "Run SwiftLint on the project (requires swiftlint on PATH)",
-                usage: "xcode lint [extra swiftlint args]", flags: ["--json"]),
+                usage: "xcode-agent lint [extra swiftlint args]", flags: ["--json"]),
     CommandSpec(name: "test", summary: "Run tests and report a summary",
-                usage: "xcode test [extra tool args]", flags: ["--json"]),
+                usage: "xcode-agent test [extra tool args]", flags: ["--json"]),
     CommandSpec(name: "simulator", summary: "Manage simulators (list/boot/shutdown)",
-                usage: "xcode simulator <list|boot|shutdown> [name|udid|all]", flags: ["--json"]),
+                usage: "xcode-agent simulator <list|boot|shutdown> [name|udid|all]", flags: ["--json"]),
     CommandSpec(name: "screenshot", summary: "Take a screenshot of a running simulator",
-                usage: "xcode screenshot [--simulator <name|udid>] [<output.png>]",
+                usage: "xcode-agent screenshot [--simulator <name|udid>] [<output.png>]",
                 flags: ["--simulator", "--json"]),
     CommandSpec(name: "log", summary: "Stream live logs from a simulator app",
-                usage: "xcode log [--simulator <name|udid>] [--bundle-id <id>] [extra log stream args]",
+                usage: "xcode-agent log [--simulator <name|udid>] [--bundle-id <id>] [extra log stream args]",
                 flags: ["--simulator", "--bundle-id"]),
     CommandSpec(name: "skills", summary: "Discover and read SKILL.md instruction sets",
-                usage: "xcode skills <list|show> [name]", flags: ["--json"]),
+                usage: "xcode-agent skills <list|show> [name]", flags: ["--json"]),
     CommandSpec(name: "docs", summary: "Knowledge-base pointers for a query",
-                usage: "xcode docs <query>", flags: ["--json"]),
+                usage: "xcode-agent docs <query>", flags: ["--json"]),
 ]
 
 // MARK: - Shared build/test runner (summary-only structured output)
@@ -187,7 +187,7 @@ enum CreateCommand {
 
         guard let projectName = name else {
             Out.fail("create", error: "missing project name",
-                     hint: "usage: xcode create <Name> [--template app|package] [--platform ios|macos] [--bundle-id <id>] [--no-generate]",
+                     hint: "usage: xcode-agent create <Name> [--template app|package] [--platform ios|macos] [--bundle-id <id>] [--no-generate]",
                      code: ExitCode.usage, ctx)
         }
         guard ["app", "package"].contains(template) else {
@@ -274,7 +274,7 @@ enum BuildCommand {
                                args: ["swift", "build"] + args, ctx)
         case .none:
             Out.fail("build", error: "no project found in current directory",
-                     hint: "run `xcode create <Name>` or cd into a project", code: ExitCode.usage, ctx)
+                     hint: "run `xcode-agentcreate <Name>` or cd into a project", code: ExitCode.usage, ctx)
         }
     }
 }
@@ -296,7 +296,7 @@ enum TestCommand {
                                args: ["swift", "test"] + args, ctx)
         case .none:
             Out.fail("test", error: "no project found in current directory",
-                     hint: "run `xcode create <Name>` or cd into a project", code: ExitCode.usage, ctx)
+                     hint: "run `xcode-agentcreate <Name>` or cd into a project", code: ExitCode.usage, ctx)
         }
     }
 
@@ -398,7 +398,7 @@ enum RunCommand {
             }
         case .none:
             Out.fail("run", error: "no project found in current directory",
-                     hint: "run `xcode create <Name>`", code: ExitCode.usage, ctx)
+                     hint: "run `xcode-agentcreate <Name>`", code: ExitCode.usage, ctx)
         }
     }
 
@@ -443,7 +443,7 @@ enum RunCommand {
         guard buildResult.exitCode == 0 else {
             if !buildResult.stderr.isEmpty { Out.stderr(buildResult.stderr) }
             Out.fail("run", error: "build failed (exit \(buildResult.exitCode))",
-                     hint: "run `xcode build` for full diagnostics", code: ExitCode.runtime, ctx)
+                     hint: "run `xcode-agentbuild` for full diagnostics", code: ExitCode.runtime, ctx)
         }
 
         guard let appPath = findApp(in: derivedDataPath, scheme: schemeName) else {
@@ -549,7 +549,7 @@ enum RunCommand {
                   }),
                   let udid = sim["udid"] as? String else {
                 Out.fail("run", error: "simulator not found: '\(target)'",
-                         hint: "run `xcode simulator list` to see available devices",
+                         hint: "run `xcode-agentsimulator list` to see available devices",
                          code: ExitCode.runtime, ctx)
             }
             Shell.run("/usr/bin/xcrun", ["simctl", "boot", udid])
@@ -703,7 +703,7 @@ enum RunCommand {
         }
 
         Out.fail("run", error: "device not found: '\(target)'",
-                 hint: "run `xcode devices` to list connected devices",
+                 hint: "run `xcode-agentdevices` to list connected devices",
                  code: ExitCode.runtime, ctx)
     }
 }
@@ -810,7 +810,7 @@ enum OpenCommand {
             exit(Shell.runStreaming("/usr/bin/open", [cwd + "/Package.swift"]))
         }
         Out.fail("open", error: "no Xcode project found in current directory",
-                 hint: "cd into a project or run `xcode create <Name>`", code: ExitCode.usage, ctx)
+                 hint: "cd into a project or run `xcode-agentcreate <Name>`", code: ExitCode.usage, ctx)
     }
 }
 
@@ -917,7 +917,7 @@ enum SimulatorCommand {
         case "boot":
             guard let target = rest.first else {
                 Out.fail("simulator", error: "missing simulator",
-                         hint: "usage: xcode simulator boot <udid|name>", code: ExitCode.usage, ctx)
+                         hint: "usage: xcode-agent simulator boot <udid|name>", code: ExitCode.usage, ctx)
             }
             exit(Shell.runStreaming("/usr/bin/xcrun", ["simctl", "boot", target]))
         case "shutdown":
@@ -962,12 +962,12 @@ enum SkillsCommand {
         case "show":
             guard let target = args.dropFirst().first else {
                 Out.fail("skills", error: "missing skill name",
-                         hint: "usage: xcode skills show <name>", code: ExitCode.usage, ctx)
+                         hint: "usage: xcode-agent skills show <name>", code: ExitCode.usage, ctx)
             }
             guard let skill = discover().first(where: { $0.name == target }),
                   let content = try? String(contentsOfFile: skill.path, encoding: .utf8) else {
                 Out.fail("skills", error: "skill not found: \(target)",
-                         hint: "run `xcode skills list`", code: ExitCode.runtime, ctx)
+                         hint: "run `xcode-agentskills list`", code: ExitCode.runtime, ctx)
             }
             print(content)
         default:
@@ -1016,7 +1016,7 @@ enum DocsCommand {
         let query = args.joined(separator: " ").trimmingCharacters(in: .whitespaces)
         guard !query.isEmpty else {
             Out.fail("docs", error: "missing query",
-                     hint: "usage: xcode docs <query>", code: ExitCode.usage, ctx)
+                     hint: "usage: xcode-agent docs <query>", code: ExitCode.usage, ctx)
         }
         let encoded = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? query
         let sources: [String: String] = [
