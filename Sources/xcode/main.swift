@@ -1,6 +1,6 @@
 import Foundation
 
-let version = "0.1.0"
+let version = "0.2.0"
 
 // Extract the global --json flag from anywhere in the argument list.
 var jsonMode = false
@@ -57,8 +57,9 @@ case "open":              OpenCommand.run(rest, ctx)
 case "lint":              LintCommand.run(rest, ctx)
 case "skills":            SkillsCommand.run(rest, ctx)
 case "docs":              DocsCommand.run(rest, ctx)
+case "ui":                UICommand.run(rest, ctx)
 case "version", "--version", "-v":
-    if ctx.json { Out.printJSON(["version": version]) } else { print("xcode-agent \(version)") }
+    Out.success("version", data: ["version": version], human: "xcode-agent \(version)", ctx)
 case "help", "--help", "-h":
     printRootHelp()
 default:

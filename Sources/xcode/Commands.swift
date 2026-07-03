@@ -16,6 +16,8 @@ let commandRegistry: [CommandSpec] = [
                 usage: "xcode-agent info", flags: ["--json"]),
     CommandSpec(name: "commands", summary: "List all commands (self-describing)",
                 usage: "xcode-agent commands", flags: ["--json"]),
+    CommandSpec(name: "version", summary: "Print the xcode-agent version",
+                usage: "xcode-agent version", flags: ["--json"]),
     CommandSpec(name: "create", summary: "Scaffold a new project and generate it with Tuist",
                 usage: "xcode-agent create <Name> [--template app|package] [--platform ios|macos] [--bundle-id <id>] [--no-generate]",
                 flags: ["--template", "--platform", "--bundle-id", "--no-generate", "--json"]),
@@ -29,7 +31,7 @@ let commandRegistry: [CommandSpec] = [
     CommandSpec(name: "clean", summary: "Clean build artifacts for the project in the current directory",
                 usage: "xcode-agent clean", flags: ["--json"]),
     CommandSpec(name: "open", summary: "Open the project in Xcode",
-                usage: "xcode-agent open", flags: []),
+                usage: "xcode-agent open", flags: ["--json"]),
     CommandSpec(name: "lint", summary: "Run SwiftLint on the project (requires swiftlint on PATH)",
                 usage: "xcode-agent lint [extra swiftlint args]", flags: ["--json"]),
     CommandSpec(name: "test", summary: "Run tests and report a summary",
@@ -46,6 +48,10 @@ let commandRegistry: [CommandSpec] = [
                 usage: "xcode-agent skills <list|show> [name]", flags: ["--json"]),
     CommandSpec(name: "docs", summary: "Knowledge-base pointers for a query",
                 usage: "xcode-agent docs <query>", flags: ["--json"]),
+    CommandSpec(name: "ui", summary: "Inspect and interact with a simulator's UI via idb",
+                usage: "xcode-agent ui <describe|verify|tap|swipe|input|button> [--simulator <name|udid>] ...",
+                flags: ["--simulator", "--id", "--label", "--type", "--value", "--frame",
+                        "--duration", "--delta", "--json"]),
 ]
 
 // MARK: - Shared build/test runner (summary-only structured output)
@@ -93,12 +99,16 @@ enum InfoCommand {
         let xcodebuild = Toolchain.xcodebuildVersion ?? "(Xcode not installed — Command Line Tools only)"
         let swift = Toolchain.swiftVersion?.components(separatedBy: "\n").first ?? "(unknown)"
         let tuist = Toolchain.tuistPath ?? "(not installed)"
+        let idb = Toolchain.which("idb") ?? "(not installed)"
+        let swiftlint = Toolchain.which("swiftlint") ?? "(not installed)"
         let data: [String: Any] = [
             "developerDir": dev,
             "fullXcode": Toolchain.hasFullXcode,
             "xcodebuild": xcodebuild,
             "swift": swift,
             "tuist": tuist,
+            "idb": idb,
+            "swiftlint": swiftlint,
         ]
         let human = """
         xcode-agent — toolchain info
@@ -107,6 +117,8 @@ enum InfoCommand {
           xcodebuild    : \(xcodebuild)
           swift         : \(swift)
           tuist         : \(tuist)
+          idb           : \(idb)
+          swiftlint     : \(swiftlint)
         """
         Out.success("info", data: data, human: human, ctx)
     }
@@ -128,6 +140,10 @@ enum DoctorCommand {
         check("simctl", Toolchain.hasSimctl, Toolchain.hasSimctl ? "ok" : "requires full Xcode")
         check("tuist", Toolchain.tuistPath != nil,
               Toolchain.tuistPath ?? "install: brew install tuist")
+        check("idb", Toolchain.which("idb") != nil,
+              Toolchain.which("idb") ?? "install: brew install facebook/fb/idb-companion && pip3 install fb-idb (required for `ui` commands)")
+        check("swiftlint", Toolchain.which("swiftlint") != nil,
+              Toolchain.which("swiftlint") ?? "install: brew install swiftlint (optional, required for `lint`)")
 
         let allOK = checks.allSatisfy { ($0["ok"] as? Bool) ?? false }
         if ctx.json {
@@ -274,7 +290,7 @@ enum BuildCommand {
                                args: ["swift", "build"] + args, ctx)
         case .none:
             Out.fail("build", error: "no project found in current directory",
-                     hint: "run `xcode-agentcreate <Name>` or cd into a project", code: ExitCode.usage, ctx)
+                     hint: "run `xcode-agent create <Name>` or cd into a project", code: ExitCode.usage, ctx)
         }
     }
 }
@@ -296,7 +312,7 @@ enum TestCommand {
                                args: ["swift", "test"] + args, ctx)
         case .none:
             Out.fail("test", error: "no project found in current directory",
-                     hint: "run `xcode-agentcreate <Name>` or cd into a project", code: ExitCode.usage, ctx)
+                     hint: "run `xcode-agent create <Name>` or cd into a project", code: ExitCode.usage, ctx)
         }
     }
 
@@ -398,7 +414,7 @@ enum RunCommand {
             }
         case .none:
             Out.fail("run", error: "no project found in current directory",
-                     hint: "run `xcode-agentcreate <Name>`", code: ExitCode.usage, ctx)
+                     hint: "run `xcode-agent create <Name>`", code: ExitCode.usage, ctx)
         }
     }
 
@@ -443,7 +459,7 @@ enum RunCommand {
         guard buildResult.exitCode == 0 else {
             if !buildResult.stderr.isEmpty { Out.stderr(buildResult.stderr) }
             Out.fail("run", error: "build failed (exit \(buildResult.exitCode))",
-                     hint: "run `xcode-agentbuild` for full diagnostics", code: ExitCode.runtime, ctx)
+                     hint: "run `xcode-agent build` for full diagnostics", code: ExitCode.runtime, ctx)
         }
 
         guard let appPath = findApp(in: derivedDataPath, scheme: schemeName) else {
@@ -529,15 +545,28 @@ enum RunCommand {
         return plist["CFBundleIdentifier"] as? String
     }
 
+    /// Boot a simulator, tolerating the "already booted" case.
+    static func bootSimulator(udid: String, command: String, _ ctx: Context) {
+        let result = Shell.run("/usr/bin/xcrun", ["simctl", "boot", udid])
+        // simctl boot exits 149 (or mentions "current state: Booted") when already booted — not an error.
+        if result.exitCode != 0 && !result.stderr.contains("Booted") {
+            Out.fail(command,
+                     error: "failed to boot simulator \(udid): \(result.stderr.trimmingCharacters(in: .whitespacesAndNewlines))",
+                     hint: "run `xcode-agent simulator list` to check device state",
+                     code: ExitCode.runtime, ctx)
+        }
+    }
+
     /// Returns a booted simulator UDID, booting one if necessary.
-    static func findOrBootSimulator(target: String?, _ ctx: Context) -> String {
+    /// `command` is the caller's command name, used in error envelopes.
+    static func findOrBootSimulator(target: String?, command: String = "run", _ ctx: Context) -> String {
         let result = Shell.run("/usr/bin/xcrun", ["simctl", "list", "devices", "available", "--json"])
         guard result.exitCode == 0,
               let data    = result.stdout.data(using: .utf8),
               let json    = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let devices = json["devices"] as? [String: [[String: Any]]]
         else {
-            Out.fail("run", error: "could not list simulators",
+            Out.fail(command, error: "could not list simulators",
                      hint: "check that simctl is available (requires full Xcode)", code: ExitCode.envNotReady, ctx)
         }
 
@@ -548,11 +577,13 @@ enum RunCommand {
                       ($0["udid"] as? String) == target || ($0["name"] as? String) == target
                   }),
                   let udid = sim["udid"] as? String else {
-                Out.fail("run", error: "simulator not found: '\(target)'",
-                         hint: "run `xcode-agentsimulator list` to see available devices",
+                Out.fail(command, error: "simulator not found: '\(target)'",
+                         hint: "run `xcode-agent simulator list` to see available devices",
                          code: ExitCode.runtime, ctx)
             }
-            Shell.run("/usr/bin/xcrun", ["simctl", "boot", udid])
+            if (sim["state"] as? String) != "Booted" {
+                bootSimulator(udid: udid, command: command, ctx)
+            }
             return udid
         }
 
@@ -566,12 +597,12 @@ enum RunCommand {
                let sim  = sims.first(where: { ($0["name"] as? String ?? "").contains("iPhone") }),
                let udid = sim["udid"] as? String {
                 Out.stderr("Booting \(sim["name"] as? String ?? udid)…")
-                Shell.run("/usr/bin/xcrun", ["simctl", "boot", udid])
+                bootSimulator(udid: udid, command: command, ctx)
                 return udid
             }
         }
 
-        Out.fail("run", error: "no iOS simulator available",
+        Out.fail(command, error: "no iOS simulator available",
                  hint: "install a simulator runtime in Xcode Settings → Platforms",
                  code: ExitCode.envNotReady, ctx)
     }
@@ -703,7 +734,7 @@ enum RunCommand {
         }
 
         Out.fail("run", error: "device not found: '\(target)'",
-                 hint: "run `xcode-agentdevices` to list connected devices",
+                 hint: "run `xcode-agent devices` to list connected devices",
                  code: ExitCode.runtime, ctx)
     }
 }
@@ -793,6 +824,17 @@ enum CleanCommand {
 // MARK: - open
 
 enum OpenCommand {
+    static func openPath(_ path: String, _ ctx: Context) -> Never {
+        let result = Shell.run("/usr/bin/open", [path])
+        guard result.exitCode == 0 else {
+            Out.fail("open",
+                     error: "open failed: \(result.stderr.trimmingCharacters(in: .whitespacesAndNewlines))",
+                     code: ExitCode.runtime, ctx)
+        }
+        Out.success("open", data: ["path": path], human: "Opened \(path)", ctx)
+        exit(ExitCode.ok)
+    }
+
     static func run(_ args: [String], _ ctx: Context) {
         let cwd = FileManager.default.currentDirectoryPath
         let fm  = FileManager.default
@@ -800,17 +842,17 @@ enum OpenCommand {
         // Prefer workspace (Tuist / CocoaPods generate one)
         if let entries = try? fm.contentsOfDirectory(atPath: cwd) {
             if let ws = entries.first(where: { $0.hasSuffix(".xcworkspace") }) {
-                exit(Shell.runStreaming("/usr/bin/open", [cwd + "/" + ws]))
+                openPath(cwd + "/" + ws, ctx)
             }
             if let proj = entries.first(where: { $0.hasSuffix(".xcodeproj") }) {
-                exit(Shell.runStreaming("/usr/bin/open", [cwd + "/" + proj]))
+                openPath(cwd + "/" + proj, ctx)
             }
         }
         if fm.fileExists(atPath: cwd + "/Package.swift") {
-            exit(Shell.runStreaming("/usr/bin/open", [cwd + "/Package.swift"]))
+            openPath(cwd + "/Package.swift", ctx)
         }
         Out.fail("open", error: "no Xcode project found in current directory",
-                 hint: "cd into a project or run `xcode-agentcreate <Name>`", code: ExitCode.usage, ctx)
+                 hint: "cd into a project or run `xcode-agent create <Name>`", code: ExitCode.usage, ctx)
     }
 }
 
@@ -844,7 +886,7 @@ enum ScreenshotCommand {
             idx += 1
         }
 
-        let simUDID = RunCommand.findOrBootSimulator(target: simulatorTarget, ctx)
+        let simUDID = RunCommand.findOrBootSimulator(target: simulatorTarget, command: "screenshot", ctx)
         let path = outputPath ?? (FileManager.default.currentDirectoryPath + "/screenshot.png")
 
         let result = Shell.run("/usr/bin/xcrun", ["simctl", "io", simUDID, "screenshot", path])
@@ -879,15 +921,18 @@ enum LogCommand {
             idx += 1
         }
 
-        let simUDID = RunCommand.findOrBootSimulator(target: simulatorTarget, ctx)
+        let simUDID = RunCommand.findOrBootSimulator(target: simulatorTarget, command: "log", ctx)
 
         // `simctl spawn <udid> log stream` runs the host's `log` tool inside
         // the simulator's process namespace, giving us the simulator's unified log.
         var logArgs = ["simctl", "spawn", simUDID, "log", "stream", "--level", "debug"]
         if let bid = bundleId {
             // Filter to the specific app via its bundle ID subsystem or image path.
+            // Escape quotes/backslashes so the value can't break out of the predicate string.
+            let escaped = bid.replacingOccurrences(of: "\\", with: "\\\\")
+                             .replacingOccurrences(of: "\"", with: "\\\"")
             logArgs += ["--predicate",
-                        "subsystem == \"\(bid)\" OR processImagePath CONTAINS \"\(bid)\""]
+                        "subsystem == \"\(escaped)\" OR processImagePath CONTAINS \"\(escaped)\""]
         }
         logArgs += extraArgs
 
@@ -910,7 +955,26 @@ enum SimulatorCommand {
         case "list":
             if ctx.json {
                 let result = Shell.run("/usr/bin/xcrun", ["simctl", "list", "devices", "available", "--json"])
-                print(result.stdout)
+                guard result.exitCode == 0,
+                      let data = result.stdout.data(using: .utf8),
+                      let raw  = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let devs = raw["devices"] as? [String: [[String: Any]]]
+                else {
+                    Out.printJSON(["ok": false, "command": "simulator list",
+                                   "data": ["devices": [:]], "error": "simctl failed", "hint": NSNull()])
+                    exit(ExitCode.runtime)
+                }
+                // Flatten to a list of {name, udid, state, runtime} for agent convenience
+                let flat: [[String: Any]] = devs.flatMap { runtime, sims in
+                    sims.map { s in
+                        ["name": s["name"] as? String ?? "",
+                         "udid": s["udid"] as? String ?? "",
+                         "state": s["state"] as? String ?? "",
+                         "runtime": runtime]
+                    }
+                }.sorted { ($0["name"] as? String ?? "") < ($1["name"] as? String ?? "") }
+                Out.printJSON(["ok": true, "command": "simulator list",
+                               "data": ["devices": flat], "error": NSNull(), "hint": NSNull()])
             } else {
                 exit(Shell.runStreaming("/usr/bin/xcrun", ["simctl", "list", "devices", "available"]))
             }
@@ -919,10 +983,30 @@ enum SimulatorCommand {
                 Out.fail("simulator", error: "missing simulator",
                          hint: "usage: xcode-agent simulator boot <udid|name>", code: ExitCode.usage, ctx)
             }
-            exit(Shell.runStreaming("/usr/bin/xcrun", ["simctl", "boot", target]))
+            let result = Shell.run("/usr/bin/xcrun", ["simctl", "boot", target])
+            // Exit code 149 / "current state: Booted" means already booted — treat as success.
+            let ok = result.exitCode == 0 || result.stderr.contains("Booted")
+            if !ok {
+                Out.fail("simulator boot",
+                         error: result.stderr.trimmingCharacters(in: .whitespacesAndNewlines),
+                         code: ExitCode.runtime, ctx)
+            }
+            Out.success("simulator boot", data: ["target": target],
+                        human: "✓ booted \(target)", ctx)
+            exit(ExitCode.ok)
         case "shutdown":
             let target = rest.first ?? "all"
-            exit(Shell.runStreaming("/usr/bin/xcrun", ["simctl", "shutdown", target]))
+            let result = Shell.run("/usr/bin/xcrun", ["simctl", "shutdown", target])
+            // "current state: Shutdown" means already shut down — treat as success.
+            let ok = result.exitCode == 0 || result.stderr.contains("Shutdown")
+            if !ok {
+                Out.fail("simulator shutdown",
+                         error: result.stderr.trimmingCharacters(in: .whitespacesAndNewlines),
+                         code: ExitCode.runtime, ctx)
+            }
+            Out.success("simulator shutdown", data: ["target": target],
+                        human: "✓ shut down \(target)", ctx)
+            exit(ExitCode.ok)
         default:
             Out.fail("simulator", error: "unknown action '\(action)'",
                      hint: "use: list | boot | shutdown", code: ExitCode.usage, ctx)
@@ -967,7 +1051,7 @@ enum SkillsCommand {
             guard let skill = discover().first(where: { $0.name == target }),
                   let content = try? String(contentsOfFile: skill.path, encoding: .utf8) else {
                 Out.fail("skills", error: "skill not found: \(target)",
-                         hint: "run `xcode-agentskills list`", code: ExitCode.runtime, ctx)
+                         hint: "run `xcode-agent skills list`", code: ExitCode.runtime, ctx)
             }
             print(content)
         default:
@@ -1006,6 +1090,476 @@ enum SkillsCommand {
             }
         }
         return (name, description)
+    }
+}
+
+// MARK: - ui (describe / verify)
+
+enum UICommand {
+    // idb element keys vary by version; normalise here.
+    static func elementType(_ el: [String: Any]) -> String {
+        (el["type"] as? String) ?? (el["type_"] as? String) ?? "Unknown"
+    }
+    static func elementLabel(_ el: [String: Any]) -> String {
+        (el["AXLabel"] as? String)               // idb 1.1.x
+            ?? (el["accessibility_label"] as? String)
+            ?? (el["content"] as? String)
+            ?? (el["label"] as? String) ?? ""
+    }
+    static func elementValue(_ el: [String: Any]) -> String {
+        (el["AXValue"] as? String) ?? (el["value"] as? String) ?? ""
+    }
+    static func elementID(_ el: [String: Any]) -> String {
+        (el["AXUniqueId"] as? String) ?? ""
+    }
+    static func elementBounds(_ el: [String: Any]) -> [String: Double]? {
+        func extract(_ d: [String: Any]) -> [String: Double] {
+            ["x":      (d["x"]      as? Double) ?? 0,
+             "y":      (d["y"]      as? Double) ?? 0,
+             "width":  (d["width"]  as? Double) ?? 0,
+             "height": (d["height"] as? Double) ?? 0]
+        }
+        if let b = el["bounds"] as? [String: Any] { return extract(b) }
+        if let f = el["frame"]  as? [String: Any] { return extract(f) }
+        return nil
+    }
+    static func elementChildren(_ el: [String: Any]) -> [[String: Any]] {
+        (el["children"] as? [[String: Any]]) ?? []
+    }
+
+    /// Format a bounds dict as `x=X y=Y W×H` without force-unwrapping.
+    static func frameString(_ f: [String: Double]) -> String {
+        "x=\(Int(f["x"] ?? 0)) y=\(Int(f["y"] ?? 0)) \(Int(f["width"] ?? 0))×\(Int(f["height"] ?? 0))"
+    }
+
+    static func requireIDB(_ ctx: Context) -> String {
+        guard let idb = Toolchain.which("idb") else {
+            Out.fail("ui", error: "idb not found on PATH",
+                     hint: "install: brew install facebook/fb/idb-companion && pip3 install fb-idb",
+                     code: ExitCode.toolNotFound, ctx)
+        }
+        return idb
+    }
+
+    static func fetchHierarchy(udid: String, idb: String, _ ctx: Context) -> [[String: Any]] {
+        let result = Shell.run(idb, ["ui", "describe-all", "--udid", udid])
+        guard result.exitCode == 0 else {
+            Out.fail("ui",
+                     error: "idb ui describe-all failed: \(result.stderr.trimmingCharacters(in: .whitespacesAndNewlines))",
+                     hint: "ensure a simulator is booted and idb-companion is installed on this Mac",
+                     code: ExitCode.runtime, ctx)
+        }
+        let text = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let data = text.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) else {
+            Out.fail("ui", error: "could not parse idb output as JSON", code: ExitCode.runtime, ctx)
+        }
+        if let array = json as? [[String: Any]] { return array }
+        if let obj = json as? [String: Any] {
+            if let items = obj["elements"] as? [[String: Any]] { return items }
+            return [obj]
+        }
+        return []
+    }
+
+    static func flatten(_ elements: [[String: Any]]) -> [[String: Any]] {
+        var result: [[String: Any]] = []
+        for el in elements {
+            result.append(el)
+            result.append(contentsOf: flatten(elementChildren(el)))
+        }
+        return result
+    }
+
+    // MARK: Spatial tree reconstruction
+    // idb describe-all returns a flat list; rebuild hierarchy by frame containment.
+
+    static func frameArea(_ f: [String: Double]?) -> Double {
+        guard let f else { return 0 }
+        return (f["width"] ?? 0) * (f["height"] ?? 0)
+    }
+
+    static func frameContains(outer: [String: Double], inner: [String: Double]) -> Bool {
+        let ox = outer["x"] ?? 0, oy = outer["y"] ?? 0
+        let ow = outer["width"] ?? 0, oh = outer["height"] ?? 0
+        let ix = inner["x"] ?? 0, iy = inner["y"] ?? 0
+        let iw = inner["width"] ?? 0, ih = inner["height"] ?? 0
+        return ox <= ix && oy <= iy && (ox + ow) >= (ix + iw) && (oy + oh) >= (iy + ih)
+    }
+
+    static func buildSpatialTree(_ flat: [[String: Any]]) -> [[String: Any]] {
+        guard !flat.isEmpty else { return [] }
+        let n = flat.count
+        let bounds = flat.map { elementBounds($0) }
+        let areas  = bounds.map { frameArea($0) }
+
+        // For each element, find its direct parent: the smallest element that fully contains it.
+        var parentOf = Array(repeating: -1, count: n)
+        for i in 0..<n {
+            guard let ib = bounds[i], areas[i] > 0 else { continue }
+            var bestArea = Double.infinity
+            for j in 0..<n {
+                guard i != j, let jb = bounds[j], areas[j] > areas[i] else { continue }
+                if areas[j] < bestArea && frameContains(outer: jb, inner: ib) {
+                    bestArea = areas[j]; parentOf[i] = j
+                }
+            }
+        }
+
+        var childrenOf = Array(repeating: [Int](), count: n)
+        var roots = [Int]()
+        for i in 0..<n {
+            if parentOf[i] == -1 { roots.append(i) }
+            else { childrenOf[parentOf[i]].append(i) }
+        }
+
+        func build(_ i: Int) -> [String: Any] {
+            var node = flat[i]
+            node["children"] = childrenOf[i].map { build($0) }
+            return node
+        }
+        return roots.map { build($0) }
+    }
+
+    static func run(_ args: [String], _ ctx: Context) {
+        let action = args.first ?? "describe"
+        let rest = Array(args.dropFirst())
+        switch action {
+        case "describe": runDescribe(rest, ctx)
+        case "verify":   runVerify(rest, ctx)
+        case "tap":      runTap(rest, ctx)
+        case "swipe":    runSwipe(rest, ctx)
+        case "input":    runInput(rest, ctx)
+        case "button":   runButton(rest, ctx)
+        default:
+            Out.fail("ui", error: "unknown action '\(action)'",
+                     hint: "use: describe | verify | tap | swipe | input | button",
+                     code: ExitCode.usage, ctx)
+        }
+    }
+
+    static func runDescribe(_ args: [String], _ ctx: Context) {
+        requireFullXcode("ui describe", ctx)
+        let idb = requireIDB(ctx)
+
+        var simulatorTarget: String?
+        var withScreenshot = false
+        var idx = 0
+        while idx < args.count {
+            switch args[idx] {
+            case "--simulator": idx += 1; if idx < args.count { simulatorTarget = args[idx] }
+            case "--screenshot": withScreenshot = true
+            default: break
+            }
+            idx += 1
+        }
+
+        let udid = RunCommand.findOrBootSimulator(target: simulatorTarget, command: "ui describe", ctx)
+        let flat = fetchHierarchy(udid: udid, idb: idb, ctx)
+        let tree = buildSpatialTree(flat)
+
+        if withScreenshot {
+            let path = "/tmp/xcode-agent-ui-\(udid).png"
+            let shot = Shell.run("/usr/bin/xcrun", ["simctl", "io", udid, "screenshot", path])
+            if shot.exitCode == 0 {
+                Out.stderr("Screenshot saved to \(path)")
+            } else {
+                Out.stderr("warning: screenshot failed: \(shot.stderr.trimmingCharacters(in: .whitespacesAndNewlines))")
+            }
+        }
+
+        if ctx.json {
+            Out.printJSON(["ok": true, "command": "ui describe",
+                           "data": ["simulatorUDID": udid, "elements": tree, "flat": flat],
+                           "error": NSNull(), "hint": NSNull()])
+        } else {
+            printTree(tree, indent: 0)
+        }
+        exit(ExitCode.ok)
+    }
+
+    static func runVerify(_ args: [String], _ ctx: Context) {
+        requireFullXcode("ui verify", ctx)
+        let idb = requireIDB(ctx)
+
+        var simulatorTarget: String?
+        var labelQuery: String?
+        var typeQuery: String?
+        var valueQuery: String?
+        var idQuery: String?
+        var expectedFrame: [String: Double]?
+
+        var idx = 0
+        while idx < args.count {
+            switch args[idx] {
+            case "--simulator":
+                idx += 1; if idx < args.count { simulatorTarget = args[idx] }
+            case "--label":
+                idx += 1; if idx < args.count { labelQuery = args[idx] }
+            case "--type":
+                idx += 1; if idx < args.count { typeQuery = args[idx] }
+            case "--value":
+                idx += 1; if idx < args.count { valueQuery = args[idx] }
+            case "--id":
+                idx += 1; if idx < args.count { idQuery = args[idx] }
+            case "--frame":
+                idx += 1
+                if idx < args.count {
+                    let parts = args[idx].split(separator: ",")
+                        .compactMap { Double($0.trimmingCharacters(in: .whitespaces)) }
+                    if parts.count == 4 {
+                        expectedFrame = ["x": parts[0], "y": parts[1],
+                                         "width": parts[2], "height": parts[3]]
+                    }
+                }
+            default: break
+            }
+            idx += 1
+        }
+
+        guard labelQuery != nil || typeQuery != nil || valueQuery != nil || idQuery != nil else {
+            Out.fail("ui verify",
+                     error: "provide at least one of --label, --type, --value, or --id",
+                     hint: "usage: xcode-agent ui verify --id <AXUniqueId> | --label <text> [--type <type>] [--value <text>] [--frame x,y,w,h] [--simulator <udid>]",
+                     code: ExitCode.usage, ctx)
+        }
+
+        let udid = RunCommand.findOrBootSimulator(target: simulatorTarget, command: "ui verify", ctx)
+        let flat = fetchHierarchy(udid: udid, idb: idb, ctx)
+
+        let matched = flat.filter { el in
+            if let q = idQuery,    elementID(el) != q                                    { return false }
+            if let q = labelQuery, !elementLabel(el).localizedCaseInsensitiveContains(q) { return false }
+            if let q = typeQuery,  !elementType(el).localizedCaseInsensitiveContains(q)  { return false }
+            if let q = valueQuery, !elementValue(el).localizedCaseInsensitiveContains(q) { return false }
+            return true
+        }
+
+        let found = !matched.isEmpty
+        var frameOK = true
+        let first = matched.first
+
+        if let ef = expectedFrame, let el = first, let f = elementBounds(el) {
+            let tol = 5.0
+            func close(_ key: String) -> Bool { abs((f[key] ?? 0) - (ef[key] ?? 0)) < tol }
+            frameOK = close("x") && close("y") && close("width") && close("height")
+        }
+
+        let ok = found && frameOK
+        let data: [String: Any] = [
+            "matched":    found,
+            "frameOK":    frameOK,
+            "matchCount": matched.count,
+            "element":    first as Any? ?? NSNull(),
+        ]
+
+        if ctx.json {
+            Out.printJSON(["ok": ok, "command": "ui verify", "data": data,
+                           "error": ok ? NSNull() : (found ? "frame mismatch" : "element not found") as Any,
+                           "hint": NSNull()])
+        } else {
+            if !found {
+                print("✗ element not found")
+                if let q = idQuery    { print("  id    : \(q)") }
+                if let q = labelQuery { print("  label : \(q)") }
+                if let q = typeQuery  { print("  type  : \(q)") }
+                if let q = valueQuery { print("  value : \(q)") }
+            } else if !frameOK, let el = first, let f = elementBounds(el), let ef = expectedFrame {
+                print("✗ element found but frame mismatch")
+                print("  actual  : \(frameString(f))")
+                print("  expected: \(frameString(ef))")
+            } else {
+                let n = matched.count
+                print("✓ element verified (\(n) match\(n == 1 ? "" : "es"))")
+                if let el = first {
+                    let eid = elementID(el);    if !eid.isEmpty { print("  id    : \(eid)") }
+                    let lbl = elementLabel(el); if !lbl.isEmpty { print("  label : \(lbl)") }
+                    let typ = elementType(el);  print("  type  : \(typ)")
+                    if let f = elementBounds(el) {
+                        print("  frame : \(frameString(f))")
+                    }
+                }
+            }
+        }
+        exit(ok ? ExitCode.ok : ExitCode.runtime)
+    }
+
+    // MARK: idb HID interaction
+
+    static func runTap(_ args: [String], _ ctx: Context) {
+        requireFullXcode("ui tap", ctx)
+        let idb = requireIDB(ctx)
+        var simulatorTarget: String?
+        var duration: String?
+        var positional: [String] = []
+        var idx = 0
+        while idx < args.count {
+            switch args[idx] {
+            case "--simulator": idx += 1; if idx < args.count { simulatorTarget = args[idx] }
+            case "--duration":  idx += 1; if idx < args.count { duration = args[idx] }
+            default: positional.append(args[idx])
+            }
+            idx += 1
+        }
+        guard positional.count >= 2,
+              let x = Double(positional[0]),
+              let y = Double(positional[1]) else {
+            Out.fail("ui tap", error: "missing coordinates",
+                     hint: "usage: xcode-agent ui tap <x> <y> [--simulator <udid>] [--duration <secs>]",
+                     code: ExitCode.usage, ctx)
+        }
+        let udid = RunCommand.findOrBootSimulator(target: simulatorTarget, command: "ui tap", ctx)
+        var idbArgs = ["ui", "tap", String(Int(x)), String(Int(y)), "--udid", udid]
+        if let d = duration { idbArgs += ["--duration", d] }
+        let result = Shell.run(idb, idbArgs)
+        let ok = result.exitCode == 0
+        let data: [String: Any] = ["x": x, "y": y, "simulatorUDID": udid]
+        if ctx.json {
+            Out.printJSON(["ok": ok, "command": "ui tap", "data": data,
+                           "error": ok ? NSNull() : result.stderr.trimmingCharacters(in: .whitespacesAndNewlines) as Any,
+                           "hint": NSNull()])
+        } else {
+            if ok { print("✓ tapped (\(Int(x)), \(Int(y)))") }
+            else { Out.stderr("error: \(result.stderr.trimmingCharacters(in: .whitespacesAndNewlines))") }
+        }
+        exit(ok ? ExitCode.ok : ExitCode.runtime)
+    }
+
+    static func runSwipe(_ args: [String], _ ctx: Context) {
+        requireFullXcode("ui swipe", ctx)
+        let idb = requireIDB(ctx)
+        var simulatorTarget: String?
+        var delta: String?
+        var positional: [String] = []
+        var idx = 0
+        while idx < args.count {
+            switch args[idx] {
+            case "--simulator": idx += 1; if idx < args.count { simulatorTarget = args[idx] }
+            case "--delta":     idx += 1; if idx < args.count { delta = args[idx] }
+            default: positional.append(args[idx])
+            }
+            idx += 1
+        }
+        guard positional.count >= 4,
+              let x1 = Double(positional[0]), let y1 = Double(positional[1]),
+              let x2 = Double(positional[2]), let y2 = Double(positional[3]) else {
+            Out.fail("ui swipe", error: "missing coordinates",
+                     hint: "usage: xcode-agent ui swipe <x1> <y1> <x2> <y2> [--simulator <udid>] [--delta <px>]",
+                     code: ExitCode.usage, ctx)
+        }
+        let udid = RunCommand.findOrBootSimulator(target: simulatorTarget, command: "ui swipe", ctx)
+        var idbArgs = ["ui", "swipe",
+                       String(Int(x1)), String(Int(y1)),
+                       String(Int(x2)), String(Int(y2)),
+                       "--udid", udid]
+        if let d = delta { idbArgs += ["--delta", d] }
+        let result = Shell.run(idb, idbArgs)
+        let ok = result.exitCode == 0
+        let data: [String: Any] = ["x1": x1, "y1": y1, "x2": x2, "y2": y2, "simulatorUDID": udid]
+        if ctx.json {
+            Out.printJSON(["ok": ok, "command": "ui swipe", "data": data,
+                           "error": ok ? NSNull() : result.stderr.trimmingCharacters(in: .whitespacesAndNewlines) as Any,
+                           "hint": NSNull()])
+        } else {
+            if ok { print("✓ swiped (\(Int(x1)),\(Int(y1))) → (\(Int(x2)),\(Int(y2)))") }
+            else { Out.stderr("error: \(result.stderr.trimmingCharacters(in: .whitespacesAndNewlines))") }
+        }
+        exit(ok ? ExitCode.ok : ExitCode.runtime)
+    }
+
+    static func runInput(_ args: [String], _ ctx: Context) {
+        requireFullXcode("ui input", ctx)
+        let idb = requireIDB(ctx)
+        var simulatorTarget: String?
+        var positional: [String] = []
+        var idx = 0
+        while idx < args.count {
+            switch args[idx] {
+            case "--simulator": idx += 1; if idx < args.count { simulatorTarget = args[idx] }
+            default: positional.append(args[idx])
+            }
+            idx += 1
+        }
+        guard let text = positional.first, !text.isEmpty else {
+            Out.fail("ui input", error: "missing text argument",
+                     hint: "usage: xcode-agent ui input <text> [--simulator <udid>]",
+                     code: ExitCode.usage, ctx)
+        }
+        let udid = RunCommand.findOrBootSimulator(target: simulatorTarget, command: "ui input", ctx)
+        let result = Shell.run(idb, ["ui", "text", text, "--udid", udid])
+        let ok = result.exitCode == 0
+        let data: [String: Any] = ["text": text, "simulatorUDID": udid]
+        if ctx.json {
+            Out.printJSON(["ok": ok, "command": "ui input", "data": data,
+                           "error": ok ? NSNull() : result.stderr.trimmingCharacters(in: .whitespacesAndNewlines) as Any,
+                           "hint": NSNull()])
+        } else {
+            if ok { print("✓ typed: \(text)") }
+            else { Out.stderr("error: \(result.stderr.trimmingCharacters(in: .whitespacesAndNewlines))") }
+        }
+        exit(ok ? ExitCode.ok : ExitCode.runtime)
+    }
+
+    static func runButton(_ args: [String], _ ctx: Context) {
+        requireFullXcode("ui button", ctx)
+        let idb = requireIDB(ctx)
+        var simulatorTarget: String?
+        var duration: String?
+        var positional: [String] = []
+        var idx = 0
+        while idx < args.count {
+            switch args[idx] {
+            case "--simulator": idx += 1; if idx < args.count { simulatorTarget = args[idx] }
+            case "--duration":  idx += 1; if idx < args.count { duration = args[idx] }
+            default: positional.append(args[idx])
+            }
+            idx += 1
+        }
+        let validButtons = Set(["HOME", "LOCK", "SIDE_BUTTON", "SIRI", "APPLE_PAY"])
+        guard let buttonRaw = positional.first else {
+            Out.fail("ui button", error: "missing button name",
+                     hint: "usage: xcode-agent ui button <home|lock|siri|side_button|apple_pay> [--simulator <udid>] [--duration <secs>]",
+                     code: ExitCode.usage, ctx)
+        }
+        let button = buttonRaw.uppercased()
+        guard validButtons.contains(button) else {
+            Out.fail("ui button", error: "unknown button '\(buttonRaw)'",
+                     hint: "valid values: home | lock | siri | side_button | apple_pay",
+                     code: ExitCode.usage, ctx)
+        }
+        let udid = RunCommand.findOrBootSimulator(target: simulatorTarget, command: "ui button", ctx)
+        var idbArgs = ["ui", "button", button, "--udid", udid]
+        if let d = duration { idbArgs += ["--duration", d] }
+        let result = Shell.run(idb, idbArgs)
+        let ok = result.exitCode == 0
+        let data: [String: Any] = ["button": button, "simulatorUDID": udid]
+        if ctx.json {
+            Out.printJSON(["ok": ok, "command": "ui button", "data": data,
+                           "error": ok ? NSNull() : result.stderr.trimmingCharacters(in: .whitespacesAndNewlines) as Any,
+                           "hint": NSNull()])
+        } else {
+            if ok { print("✓ pressed \(button)") }
+            else { Out.stderr("error: \(result.stderr.trimmingCharacters(in: .whitespacesAndNewlines))") }
+        }
+        exit(ok ? ExitCode.ok : ExitCode.runtime)
+    }
+
+    static func printTree(_ elements: [[String: Any]], indent: Int) {
+        let pad = String(repeating: "  ", count: indent)
+        for el in elements {
+            var line = "\(pad)\(elementType(el))"
+            let lbl = elementLabel(el)
+            let val = elementValue(el)
+            let text = !lbl.isEmpty ? lbl : val
+            if !text.isEmpty { line += " \"\(text)\"" }
+            if let f = elementBounds(el) {
+                line += " [\(Int(f["x"] ?? 0)),\(Int(f["y"] ?? 0)) \(Int(f["width"] ?? 0))×\(Int(f["height"] ?? 0))]"
+            }
+            let id = elementID(el)
+            if !id.isEmpty { line += " id=\(id)" }
+            print(line)
+            printTree(elementChildren(el), indent: indent + 1)
+        }
     }
 }
 
