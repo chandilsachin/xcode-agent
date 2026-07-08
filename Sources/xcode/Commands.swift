@@ -48,10 +48,10 @@ let commandRegistry: [CommandSpec] = [
                 usage: "xcode-agent skills <list|show> [name]", flags: ["--json"]),
     CommandSpec(name: "docs", summary: "Knowledge-base pointers for a query",
                 usage: "xcode-agent docs <query>", flags: ["--json"]),
-    CommandSpec(name: "ui", summary: "Inspect and interact with a simulator's UI via idb",
-                usage: "xcode-agent ui <describe|verify|tap|swipe|input|button> [--simulator <name|udid>] ...",
+    CommandSpec(name: "ui", summary: "Inspect and interact with a simulator's UI",
+                usage: "xcode-agent ui <describe|verify|tap|swipe|input|button|driver> [--simulator <name|udid>] ...",
                 flags: ["--simulator", "--id", "--label", "--type", "--value", "--frame",
-                        "--duration", "--delta", "--json"]),
+                        "--bundle-id", "--duration", "--delta", "--json"]),
 ]
 
 // MARK: - Shared build/test runner (summary-only structured output)
@@ -487,6 +487,7 @@ enum RunCommand {
         let launchResult = Shell.run("/usr/bin/xcrun", ["simctl", "launch", simUDID, bid])
         let pid = launchResult.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
         let ok  = launchResult.exitCode == 0
+        if ok { UIDriver.recordLaunchedApp(bundleId: bid, udid: simUDID) }
 
         let data: [String: Any] = [
             "scheme":         schemeName,
@@ -1231,9 +1232,10 @@ enum UICommand {
         case "swipe":    runSwipe(rest, ctx)
         case "input":    runInput(rest, ctx)
         case "button":   runButton(rest, ctx)
+        case "driver":   runDriver(rest, ctx)
         default:
             Out.fail("ui", error: "unknown action '\(action)'",
-                     hint: "use: describe | verify | tap | swipe | input | button",
+                     hint: "use: describe | verify | tap | swipe | input | button | driver",
                      code: ExitCode.usage, ctx)
         }
     }
@@ -1384,58 +1386,95 @@ enum UICommand {
         exit(ok ? ExitCode.ok : ExitCode.runtime)
     }
 
-    // MARK: idb HID interaction
+    // MARK: HID interaction (XCUITest driver backend)
 
-    static func runTap(_ args: [String], _ ctx: Context) {
-        requireFullXcode("ui tap", ctx)
-        let idb = requireIDB(ctx)
-        var simulatorTarget: String?
-        var duration: String?
-        var positional: [String] = []
-        var idx = 0
-        while idx < args.count {
-            switch args[idx] {
-            case "--simulator": idx += 1; if idx < args.count { simulatorTarget = args[idx] }
-            case "--duration":  idx += 1; if idx < args.count { duration = args[idx] }
-            default: positional.append(args[idx])
-            }
-            idx += 1
+    /// Bundle id for element-targeted commands: --bundle-id flag, else the app
+    /// last launched via `xcode-agent run` on this simulator.
+    static func resolveBundleId(flag: String?, udid: String, command: String, _ ctx: Context) -> String {
+        if let flag, !flag.isEmpty { return flag }
+        if let last = UIDriver.lastLaunchedBundleId(udid: udid), !last.isEmpty { return last }
+        Out.fail(command, error: "no target app known for this simulator",
+                 hint: "pass --bundle-id <id>, or launch the app first with: xcode-agent run",
+                 code: ExitCode.usage, ctx)
+    }
+
+    /// Run one driver command and emit the standard success/failure output.
+    static func driverAction(command: String, udid: String, path: String,
+                             body: [String: Any], data: [String: Any],
+                             successText: String, _ ctx: Context) -> Never {
+        let port = UIDriver.ensureRunning(udid: udid, command: command, ctx)
+        guard let response = UIDriver.request(port: port, method: "POST", path: path, body: body, timeout: 60) else {
+            Out.fail(command, error: "lost connection to the UI driver",
+                     hint: "retry the command; check the driver log: \(UIDriver.baseDir)/driver-\(udid).log",
+                     code: ExitCode.runtime, ctx)
         }
-        guard positional.count >= 2,
-              let x = Double(positional[0]),
-              let y = Double(positional[1]) else {
-            Out.fail("ui tap", error: "missing coordinates",
-                     hint: "usage: xcode-agent ui tap <x> <y> [--simulator <udid>] [--duration <secs>]",
-                     code: ExitCode.usage, ctx)
-        }
-        let udid = RunCommand.findOrBootSimulator(target: simulatorTarget, command: "ui tap", ctx)
-        var idbArgs = ["ui", "tap", String(Int(x)), String(Int(y)), "--udid", udid]
-        if let d = duration { idbArgs += ["--duration", d] }
-        let result = Shell.run(idb, idbArgs)
-        let ok = result.exitCode == 0
-        let data: [String: Any] = ["x": x, "y": y, "simulatorUDID": udid]
+        let ok = response.ok
         if ctx.json {
-            Out.printJSON(["ok": ok, "command": "ui tap", "data": data,
-                           "error": ok ? NSNull() : result.stderr.trimmingCharacters(in: .whitespacesAndNewlines) as Any,
+            Out.printJSON(["ok": ok, "command": command, "data": data,
+                           "error": ok ? NSNull() : (response.error ?? "driver error") as Any,
                            "hint": NSNull()])
         } else {
-            if ok { print("✓ tapped (\(Int(x)), \(Int(y)))") }
-            else { Out.stderr("error: \(result.stderr.trimmingCharacters(in: .whitespacesAndNewlines))") }
+            if ok { print(successText) }
+            else { Out.stderr("error: \(response.error ?? "driver error")") }
         }
         exit(ok ? ExitCode.ok : ExitCode.runtime)
     }
 
-    static func runSwipe(_ args: [String], _ ctx: Context) {
-        requireFullXcode("ui swipe", ctx)
-        let idb = requireIDB(ctx)
+    static func runTap(_ args: [String], _ ctx: Context) {
+        requireFullXcode("ui tap", ctx)
         var simulatorTarget: String?
-        var delta: String?
+        var duration: Double?
+        var elementID: String?
+        var bundleIDFlag: String?
         var positional: [String] = []
         var idx = 0
         while idx < args.count {
             switch args[idx] {
             case "--simulator": idx += 1; if idx < args.count { simulatorTarget = args[idx] }
-            case "--delta":     idx += 1; if idx < args.count { delta = args[idx] }
+            case "--duration":  idx += 1; if idx < args.count { duration = Double(args[idx]) }
+            case "--id":        idx += 1; if idx < args.count { elementID = args[idx] }
+            case "--bundle-id": idx += 1; if idx < args.count { bundleIDFlag = args[idx] }
+            default: positional.append(args[idx])
+            }
+            idx += 1
+        }
+
+        let udid = RunCommand.findOrBootSimulator(target: simulatorTarget, command: "ui tap", ctx)
+
+        if let elementID {
+            let bundleId = resolveBundleId(flag: bundleIDFlag, udid: udid, command: "ui tap", ctx)
+            driverAction(command: "ui tap", udid: udid, path: "/tapElement",
+                         body: ["id": elementID, "bundleId": bundleId],
+                         data: ["id": elementID, "bundleId": bundleId, "simulatorUDID": udid],
+                         successText: "✓ tapped element '\(elementID)'", ctx)
+        }
+
+        guard positional.count >= 2,
+              let x = Double(positional[0]),
+              let y = Double(positional[1]) else {
+            Out.fail("ui tap", error: "missing coordinates or --id",
+                     hint: "usage: xcode-agent ui tap <x> <y> | --id <accessibility-id> [--bundle-id <id>] [--simulator <udid>] [--duration <secs>]",
+                     code: ExitCode.usage, ctx)
+        }
+        var body: [String: Any] = ["x": x, "y": y]
+        if let duration { body["duration"] = duration }
+        driverAction(command: "ui tap", udid: udid, path: "/tap",
+                     body: body,
+                     data: ["x": x, "y": y, "simulatorUDID": udid],
+                     successText: "✓ tapped (\(Int(x)), \(Int(y)))", ctx)
+    }
+
+    static func runSwipe(_ args: [String], _ ctx: Context) {
+        requireFullXcode("ui swipe", ctx)
+        var simulatorTarget: String?
+        var duration: Double?
+        var positional: [String] = []
+        var idx = 0
+        while idx < args.count {
+            switch args[idx] {
+            case "--simulator": idx += 1; if idx < args.count { simulatorTarget = args[idx] }
+            case "--duration":  idx += 1; if idx < args.count { duration = Double(args[idx]) }
+            case "--delta":     idx += 1 // accepted for back-compat; the xcuitest backend ignores it
             default: positional.append(args[idx])
             }
             idx += 1
@@ -1444,104 +1483,117 @@ enum UICommand {
               let x1 = Double(positional[0]), let y1 = Double(positional[1]),
               let x2 = Double(positional[2]), let y2 = Double(positional[3]) else {
             Out.fail("ui swipe", error: "missing coordinates",
-                     hint: "usage: xcode-agent ui swipe <x1> <y1> <x2> <y2> [--simulator <udid>] [--delta <px>]",
+                     hint: "usage: xcode-agent ui swipe <x1> <y1> <x2> <y2> [--simulator <udid>] [--duration <secs>]",
                      code: ExitCode.usage, ctx)
         }
         let udid = RunCommand.findOrBootSimulator(target: simulatorTarget, command: "ui swipe", ctx)
-        var idbArgs = ["ui", "swipe",
-                       String(Int(x1)), String(Int(y1)),
-                       String(Int(x2)), String(Int(y2)),
-                       "--udid", udid]
-        if let d = delta { idbArgs += ["--delta", d] }
-        let result = Shell.run(idb, idbArgs)
-        let ok = result.exitCode == 0
-        let data: [String: Any] = ["x1": x1, "y1": y1, "x2": x2, "y2": y2, "simulatorUDID": udid]
-        if ctx.json {
-            Out.printJSON(["ok": ok, "command": "ui swipe", "data": data,
-                           "error": ok ? NSNull() : result.stderr.trimmingCharacters(in: .whitespacesAndNewlines) as Any,
-                           "hint": NSNull()])
-        } else {
-            if ok { print("✓ swiped (\(Int(x1)),\(Int(y1))) → (\(Int(x2)),\(Int(y2)))") }
-            else { Out.stderr("error: \(result.stderr.trimmingCharacters(in: .whitespacesAndNewlines))") }
-        }
-        exit(ok ? ExitCode.ok : ExitCode.runtime)
+        var body: [String: Any] = ["x1": x1, "y1": y1, "x2": x2, "y2": y2]
+        if let duration { body["duration"] = duration }
+        driverAction(command: "ui swipe", udid: udid, path: "/swipe",
+                     body: body,
+                     data: ["x1": x1, "y1": y1, "x2": x2, "y2": y2, "simulatorUDID": udid],
+                     successText: "✓ swiped (\(Int(x1)),\(Int(y1))) → (\(Int(x2)),\(Int(y2)))", ctx)
     }
 
     static func runInput(_ args: [String], _ ctx: Context) {
         requireFullXcode("ui input", ctx)
-        let idb = requireIDB(ctx)
         var simulatorTarget: String?
+        var bundleIDFlag: String?
         var positional: [String] = []
         var idx = 0
         while idx < args.count {
             switch args[idx] {
             case "--simulator": idx += 1; if idx < args.count { simulatorTarget = args[idx] }
+            case "--bundle-id": idx += 1; if idx < args.count { bundleIDFlag = args[idx] }
             default: positional.append(args[idx])
             }
             idx += 1
         }
         guard let text = positional.first, !text.isEmpty else {
             Out.fail("ui input", error: "missing text argument",
-                     hint: "usage: xcode-agent ui input <text> [--simulator <udid>]",
+                     hint: "usage: xcode-agent ui input <text> [--bundle-id <id>] [--simulator <udid>]",
                      code: ExitCode.usage, ctx)
         }
         let udid = RunCommand.findOrBootSimulator(target: simulatorTarget, command: "ui input", ctx)
-        let result = Shell.run(idb, ["ui", "text", text, "--udid", udid])
-        let ok = result.exitCode == 0
-        let data: [String: Any] = ["text": text, "simulatorUDID": udid]
-        if ctx.json {
-            Out.printJSON(["ok": ok, "command": "ui input", "data": data,
-                           "error": ok ? NSNull() : result.stderr.trimmingCharacters(in: .whitespacesAndNewlines) as Any,
-                           "hint": NSNull()])
-        } else {
-            if ok { print("✓ typed: \(text)") }
-            else { Out.stderr("error: \(result.stderr.trimmingCharacters(in: .whitespacesAndNewlines))") }
-        }
-        exit(ok ? ExitCode.ok : ExitCode.runtime)
+        let bundleId = resolveBundleId(flag: bundleIDFlag, udid: udid, command: "ui input", ctx)
+        driverAction(command: "ui input", udid: udid, path: "/input",
+                     body: ["text": text, "bundleId": bundleId],
+                     data: ["text": text, "bundleId": bundleId, "simulatorUDID": udid],
+                     successText: "✓ typed: \(text)", ctx)
     }
 
     static func runButton(_ args: [String], _ ctx: Context) {
         requireFullXcode("ui button", ctx)
-        let idb = requireIDB(ctx)
         var simulatorTarget: String?
-        var duration: String?
         var positional: [String] = []
         var idx = 0
         while idx < args.count {
             switch args[idx] {
             case "--simulator": idx += 1; if idx < args.count { simulatorTarget = args[idx] }
-            case "--duration":  idx += 1; if idx < args.count { duration = args[idx] }
+            case "--duration":  idx += 1 // accepted for back-compat; ignored by the xcuitest backend
             default: positional.append(args[idx])
             }
             idx += 1
         }
-        let validButtons = Set(["HOME", "LOCK", "SIDE_BUTTON", "SIRI", "APPLE_PAY"])
         guard let buttonRaw = positional.first else {
             Out.fail("ui button", error: "missing button name",
-                     hint: "usage: xcode-agent ui button <home|lock|siri|side_button|apple_pay> [--simulator <udid>] [--duration <secs>]",
+                     hint: "usage: xcode-agent ui button <home> [--simulator <udid>]",
                      code: ExitCode.usage, ctx)
         }
-        let button = buttonRaw.uppercased()
-        guard validButtons.contains(button) else {
+        let button = buttonRaw.lowercased()
+        guard button == "home" else {
             Out.fail("ui button", error: "unknown button '\(buttonRaw)'",
-                     hint: "valid values: home | lock | siri | side_button | apple_pay",
+                     hint: "the xcuitest backend supports: home",
                      code: ExitCode.usage, ctx)
         }
         let udid = RunCommand.findOrBootSimulator(target: simulatorTarget, command: "ui button", ctx)
-        var idbArgs = ["ui", "button", button, "--udid", udid]
-        if let d = duration { idbArgs += ["--duration", d] }
-        let result = Shell.run(idb, idbArgs)
-        let ok = result.exitCode == 0
-        let data: [String: Any] = ["button": button, "simulatorUDID": udid]
-        if ctx.json {
-            Out.printJSON(["ok": ok, "command": "ui button", "data": data,
-                           "error": ok ? NSNull() : result.stderr.trimmingCharacters(in: .whitespacesAndNewlines) as Any,
-                           "hint": NSNull()])
-        } else {
-            if ok { print("✓ pressed \(button)") }
-            else { Out.stderr("error: \(result.stderr.trimmingCharacters(in: .whitespacesAndNewlines))") }
+        driverAction(command: "ui button", udid: udid, path: "/button",
+                     body: ["name": button],
+                     data: ["button": button, "simulatorUDID": udid],
+                     successText: "✓ pressed \(button)", ctx)
+    }
+
+    /// `ui driver <status|stop>` — inspect or stop the background XCUITest driver.
+    static func runDriver(_ args: [String], _ ctx: Context) {
+        requireFullXcode("ui driver", ctx)
+        var simulatorTarget: String?
+        var positional: [String] = []
+        var idx = 0
+        while idx < args.count {
+            switch args[idx] {
+            case "--simulator": idx += 1; if idx < args.count { simulatorTarget = args[idx] }
+            default: positional.append(args[idx])
+            }
+            idx += 1
         }
-        exit(ok ? ExitCode.ok : ExitCode.runtime)
+        let action = positional.first ?? "status"
+        let udid = RunCommand.findOrBootSimulator(target: simulatorTarget, command: "ui driver", ctx)
+        let port = UIDriver.portFor(udid: udid)
+        switch action {
+        case "status":
+            let running = UIDriver.isHealthy(port: port)
+            if ctx.json {
+                Out.printJSON(["ok": true, "command": "ui driver",
+                               "data": ["running": running, "port": Int(port), "simulatorUDID": udid],
+                               "error": NSNull(), "hint": NSNull()])
+            } else {
+                print(running ? "✓ driver running on port \(port)" : "✗ driver not running (port \(port))")
+            }
+            exit(ExitCode.ok)
+        case "stop":
+            let stopped = UIDriver.stop(udid: udid)
+            if ctx.json {
+                Out.printJSON(["ok": true, "command": "ui driver",
+                               "data": ["stopped": stopped, "simulatorUDID": udid],
+                               "error": NSNull(), "hint": NSNull()])
+            } else {
+                print(stopped ? "✓ driver stopped" : "driver was not running")
+            }
+            exit(ExitCode.ok)
+        default:
+            Out.fail("ui driver", error: "unknown action '\(action)'",
+                     hint: "use: status | stop", code: ExitCode.usage, ctx)
+        }
     }
 
     static func printTree(_ elements: [[String: Any]], indent: Int) {
