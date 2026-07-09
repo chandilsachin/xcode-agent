@@ -51,7 +51,7 @@ let commandRegistry: [CommandSpec] = [
     CommandSpec(name: "ui", summary: "Inspect and interact with a simulator's UI",
                 usage: "xcode-agent ui <describe|verify|tap|swipe|input|button|driver> [--simulator <name|udid>] ...",
                 flags: ["--simulator", "--id", "--label", "--type", "--value", "--frame",
-                        "--bundle-id", "--duration", "--delta", "--screenshot", "--idb", "--json"]),
+                        "--bundle-id", "--exact", "--duration", "--delta", "--screenshot", "--idb", "--json"]),
 ]
 
 // MARK: - Shared build/test runner (summary-only structured output)
@@ -1323,6 +1323,7 @@ enum UICommand {
         var simulatorTarget: String?
         var bundleIdFlag: String?
         var forceIDB = false
+        var exact = false
         var labelQuery: String?
         var typeQuery: String?
         var valueQuery: String?
@@ -1338,6 +1339,8 @@ enum UICommand {
                 idx += 1; if idx < args.count { bundleIdFlag = args[idx] }
             case "--idb":
                 forceIDB = true
+            case "--exact":
+                exact = true
             case "--label":
                 idx += 1; if idx < args.count { labelQuery = args[idx] }
             case "--type":
@@ -1364,8 +1367,16 @@ enum UICommand {
         guard labelQuery != nil || typeQuery != nil || valueQuery != nil || idQuery != nil else {
             Out.fail("ui verify",
                      error: "provide at least one of --label, --type, --value, or --id",
-                     hint: "usage: xcode-agent ui verify --id <AXUniqueId> | --label <text> [--type <type>] [--value <text>] [--frame x,y,w,h] [--simulator <udid>]",
+                     hint: "usage: xcode-agent ui verify --id <AXUniqueId> | --label <text> [--type <type>] [--value <text>] [--exact] [--frame x,y,w,h] [--simulator <udid>]",
                      code: ExitCode.usage, ctx)
+        }
+
+        // Text match: an empty query asserts the attribute is empty (e.g. a
+        // cleared field); --exact requires equality, otherwise substring.
+        func textMatches(_ actual: String, _ query: String) -> Bool {
+            if query.isEmpty { return actual.isEmpty }
+            return exact ? actual.caseInsensitiveCompare(query) == .orderedSame
+                         : actual.localizedCaseInsensitiveContains(query)
         }
 
         let udid = RunCommand.findOrBootSimulator(target: simulatorTarget, command: "ui verify", ctx)
@@ -1380,10 +1391,10 @@ enum UICommand {
         }
 
         let matched = flat.filter { el in
-            if let q = idQuery,    elementID(el) != q                                    { return false }
-            if let q = labelQuery, !elementLabel(el).localizedCaseInsensitiveContains(q) { return false }
-            if let q = typeQuery,  !elementType(el).localizedCaseInsensitiveContains(q)  { return false }
-            if let q = valueQuery, !elementValue(el).localizedCaseInsensitiveContains(q) { return false }
+            if let q = idQuery,    elementID(el) != q                      { return false }
+            if let q = labelQuery, !textMatches(elementLabel(el), q)       { return false }
+            if let q = typeQuery,  !textMatches(elementType(el), q)        { return false }
+            if let q = valueQuery, !textMatches(elementValue(el), q)       { return false }
             return true
         }
 
