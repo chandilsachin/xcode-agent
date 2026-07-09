@@ -238,7 +238,7 @@ enum DriverTemplates {
     /// Bump whenever any template below changes — invalidates cached driver
     /// builds and running drivers on user machines (CLI version alone isn't
     /// enough: templates can change between RCs of the same version).
-    static let revision = "6"
+    static let revision = "7"
 
     static let tuistConfig = #"""
     import ProjectDescription
@@ -393,7 +393,13 @@ enum DriverTemplates {
                     let inner = element.descendants(matching: .switch)
                     if inner.count > 0 { target = inner.element(boundBy: inner.count - 1) }
                 }
-                target.tap()
+                // A positive duration is a press-and-hold (long press) — opens
+                // context menus, triggers drag handles, etc.
+                if let duration = num("duration"), duration > 0 {
+                    target.press(forDuration: duration)
+                } else {
+                    target.tap()
+                }
                 return ["ok": true]
 
             case ("POST", "/scroll"):

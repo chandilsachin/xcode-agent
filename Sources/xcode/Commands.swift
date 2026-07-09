@@ -1508,18 +1508,24 @@ enum UICommand {
 
         if let elementID {
             let bundleId = resolveBundleId(flag: bundleIDFlag, udid: udid, command: "ui tap", ctx)
+            var body: [String: Any] = ["id": elementID, "bundleId": bundleId]
+            if let duration { body["duration"] = duration }
+            let verb = duration != nil ? "long-pressed" : "tapped"
             driverAction(command: "ui tap", udid: udid, path: "/tapElement",
-                         body: ["id": elementID, "bundleId": bundleId],
+                         body: body,
                          data: ["id": elementID, "bundleId": bundleId, "simulatorUDID": udid],
-                         successText: "✓ tapped element '\(elementID)'", ctx)
+                         successText: "✓ \(verb) element '\(elementID)'", ctx)
         }
 
         if let elementLabel {
             let bundleId = resolveBundleId(flag: bundleIDFlag, udid: udid, command: "ui tap", ctx)
+            var body: [String: Any] = ["label": elementLabel, "bundleId": bundleId]
+            if let duration { body["duration"] = duration }
+            let verb = duration != nil ? "long-pressed" : "tapped"
             driverAction(command: "ui tap", udid: udid, path: "/tapElement",
-                         body: ["label": elementLabel, "bundleId": bundleId],
+                         body: body,
                          data: ["label": elementLabel, "bundleId": bundleId, "simulatorUDID": udid],
-                         successText: "✓ tapped element labeled '\(elementLabel)'", ctx)
+                         successText: "✓ \(verb) element labeled '\(elementLabel)'", ctx)
         }
 
         guard positional.count >= 2,
