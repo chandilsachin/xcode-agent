@@ -49,10 +49,10 @@ let commandRegistry: [CommandSpec] = [
     CommandSpec(name: "docs", summary: "Knowledge-base pointers for a query",
                 usage: "xcode-agent docs <query>", flags: ["--json"]),
     CommandSpec(name: "ui", summary: "Inspect and interact with a simulator's UI",
-                usage: "xcode-agent ui <describe|verify|tap|swipe|scroll|input|button|driver> [--simulator <name|udid>] ...",
+                usage: "xcode-agent ui <describe|verify|tap|swipe|scroll|adjust|input|button|driver> [--simulator <name|udid>] ...",
                 flags: ["--simulator", "--id", "--label", "--to", "--type", "--value", "--frame",
                         "--bundle-id", "--exact", "--duration", "--delta", "--direction", "--max-swipes",
-                        "--screenshot", "--idb", "--json"]),
+                        "--position", "--screenshot", "--idb", "--json"]),
 ]
 
 // MARK: - Shared build/test runner (summary-only structured output)
@@ -1253,12 +1253,13 @@ enum UICommand {
         case "tap":      runTap(rest, ctx)
         case "swipe":    runSwipe(rest, ctx)
         case "scroll":   runScroll(rest, ctx)
+        case "adjust":   runAdjust(rest, ctx)
         case "input":    runInput(rest, ctx)
         case "button":   runButton(rest, ctx)
         case "driver":   runDriver(rest, ctx)
         default:
             Out.fail("ui", error: "unknown action '\(action)'",
-                     hint: "use: describe | verify | tap | swipe | scroll | input | button | driver",
+                     hint: "use: describe | verify | tap | swipe | scroll | adjust | input | button | driver",
                      code: ExitCode.usage, ctx)
         }
     }
@@ -1613,6 +1614,43 @@ enum UICommand {
                      body: body,
                      data: ["id": elementID as Any, "label": elementLabel as Any, "bundleId": bundleId, "simulatorUDID": udid],
                      successText: "✓ scrolled to element \(targetDesc)", ctx)
+    }
+
+    static func runAdjust(_ args: [String], _ ctx: Context) {
+        requireFullXcode("ui adjust", ctx)
+        var simulatorTarget: String?
+        var elementID: String?
+        var elementLabel: String?
+        var bundleIDFlag: String?
+        var position: Double?
+        var idx = 0
+        while idx < args.count {
+            switch args[idx] {
+            case "--simulator":  idx += 1; if idx < args.count { simulatorTarget = args[idx] }
+            case "--id", "--to": idx += 1; if idx < args.count { elementID = args[idx] }
+            case "--label":      idx += 1; if idx < args.count { elementLabel = args[idx] }
+            case "--bundle-id":  idx += 1; if idx < args.count { bundleIDFlag = args[idx] }
+            case "--position":   idx += 1; if idx < args.count { position = Double(args[idx]) }
+            default: break
+            }
+            idx += 1
+        }
+        guard let position, elementID != nil || elementLabel != nil else {
+            Out.fail("ui adjust", error: "missing --position and/or target",
+                     hint: "usage: xcode-agent ui adjust --id <accessibility-id> | --label <text> --position <0.0-1.0> [--bundle-id <id>] [--simulator <udid>]",
+                     code: ExitCode.usage, ctx)
+        }
+
+        let udid = RunCommand.findOrBootSimulator(target: simulatorTarget, command: "ui adjust", ctx)
+        let bundleId = resolveBundleId(flag: bundleIDFlag, udid: udid, command: "ui adjust", ctx)
+        var body: [String: Any] = ["bundleId": bundleId, "position": position]
+        if let elementID { body["id"] = elementID }
+        if let elementLabel { body["label"] = elementLabel }
+        let targetDesc = elementID.map { "'\($0)'" } ?? "labeled '\(elementLabel!)'"
+        driverAction(command: "ui adjust", udid: udid, path: "/adjustSlider",
+                     body: body,
+                     data: ["id": elementID as Any, "label": elementLabel as Any, "position": position, "bundleId": bundleId, "simulatorUDID": udid],
+                     successText: "✓ adjusted slider \(targetDesc) to \(position)", ctx)
     }
 
     static func runInput(_ args: [String], _ ctx: Context) {

@@ -238,7 +238,7 @@ enum DriverTemplates {
     /// Bump whenever any template below changes — invalidates cached driver
     /// builds and running drivers on user machines (CLI version alone isn't
     /// enough: templates can change between RCs of the same version).
-    static let revision = "7"
+    static let revision = "8"
 
     static let tuistConfig = #"""
     import ProjectDescription
@@ -401,6 +401,41 @@ enum DriverTemplates {
                     target.tap()
                 }
                 return ["ok": true]
+
+            case ("POST", "/adjustSlider"):
+                let id = req.body["id"] as? String
+                let label = req.body["label"] as? String
+                guard let bundleId = req.body["bundleId"] as? String,
+                      let position = num("position"), id != nil || label != nil else {
+                    return ["ok": false, "error": "adjustSlider requires bundleId, position, and one of id/label"]
+                }
+                guard let app = foregroundApp(bundleId) else {
+                    return ["ok": false, "error": "could not bring \(bundleId) to the foreground"]
+                }
+                let query: XCUIElementQuery
+                let needle: String
+                if let id = id {
+                    query = app.descendants(matching: .any).matching(identifier: id)
+                    needle = "id '\(id)'"
+                } else {
+                    query = app.descendants(matching: .any).matching(NSPredicate(format: "label == %@", label!))
+                    needle = "label '\(label!)'"
+                }
+                let element = query.firstMatch
+                guard element.waitForExistence(timeout: num("timeout") ?? 5) else {
+                    return ["ok": false, "error": "element \(needle) not found in \(bundleId)"]
+                }
+                // The id may sit on a container; the actual slider is that element
+                // or its innermost .slider descendant. adjust() drags the thumb the
+                // same way a user would, landing on a precise normalized position.
+                var target = element
+                if element.elementType != .slider {
+                    let inner = element.descendants(matching: .slider)
+                    if inner.count > 0 { target = inner.element(boundBy: inner.count - 1) }
+                }
+                let clamped = max(0.0, min(1.0, position))
+                target.adjust(toNormalizedSliderPosition: CGFloat(clamped))
+                return ["ok": true, "position": clamped]
 
             case ("POST", "/scroll"):
                 let id = req.body["id"] as? String
