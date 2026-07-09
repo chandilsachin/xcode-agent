@@ -238,7 +238,7 @@ enum DriverTemplates {
     /// Bump whenever any template below changes — invalidates cached driver
     /// builds and running drivers on user machines (CLI version alone isn't
     /// enough: templates can change between RCs of the same version).
-    static let revision = "2"
+    static let revision = "3"
 
     static let tuistConfig = #"""
     import ProjectDescription
@@ -373,7 +373,15 @@ enum DriverTemplates {
                 guard element.waitForExistence(timeout: num("timeout") ?? 5) else {
                     return ["ok": false, "error": "element '\(id)' not found in \(bundleId)"]
                 }
-                element.tap()
+                // A SwiftUI Toggle/switch carries its accessibility id on a full-width
+                // container whose center is the label, not the control. Drill to the
+                // innermost switch descendant so the tap actually flips it.
+                var target = element
+                if element.elementType == .switch {
+                    let inner = element.descendants(matching: .switch)
+                    if inner.count > 0 { target = inner.element(boundBy: inner.count - 1) }
+                }
+                target.tap()
                 return ["ok": true]
 
             case ("POST", "/input"):

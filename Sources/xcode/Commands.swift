@@ -1375,7 +1375,7 @@ enum UICommand {
         // cleared field); --exact requires equality, otherwise substring.
         func textMatches(_ actual: String, _ query: String) -> Bool {
             if query.isEmpty { return actual.isEmpty }
-            return exact ? actual.caseInsensitiveCompare(query) == .orderedSame
+            return exact ? actual == query
                          : actual.localizedCaseInsensitiveContains(query)
         }
 
