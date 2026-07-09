@@ -1486,6 +1486,7 @@ enum UICommand {
         var simulatorTarget: String?
         var duration: Double?
         var elementID: String?
+        var elementLabel: String?
         var bundleIDFlag: String?
         var positional: [String] = []
         var idx = 0
@@ -1494,6 +1495,7 @@ enum UICommand {
             case "--simulator": idx += 1; if idx < args.count { simulatorTarget = args[idx] }
             case "--duration":  idx += 1; if idx < args.count { duration = Double(args[idx]) }
             case "--id":        idx += 1; if idx < args.count { elementID = args[idx] }
+            case "--label":     idx += 1; if idx < args.count { elementLabel = args[idx] }
             case "--bundle-id": idx += 1; if idx < args.count { bundleIDFlag = args[idx] }
             default: positional.append(args[idx])
             }
@@ -1510,11 +1512,19 @@ enum UICommand {
                          successText: "✓ tapped element '\(elementID)'", ctx)
         }
 
+        if let elementLabel {
+            let bundleId = resolveBundleId(flag: bundleIDFlag, udid: udid, command: "ui tap", ctx)
+            driverAction(command: "ui tap", udid: udid, path: "/tapElement",
+                         body: ["label": elementLabel, "bundleId": bundleId],
+                         data: ["label": elementLabel, "bundleId": bundleId, "simulatorUDID": udid],
+                         successText: "✓ tapped element labeled '\(elementLabel)'", ctx)
+        }
+
         guard positional.count >= 2,
               let x = Double(positional[0]),
               let y = Double(positional[1]) else {
-            Out.fail("ui tap", error: "missing coordinates or --id",
-                     hint: "usage: xcode-agent ui tap <x> <y> | --id <accessibility-id> [--bundle-id <id>] [--simulator <udid>] [--duration <secs>]",
+            Out.fail("ui tap", error: "missing coordinates, --id, or --label",
+                     hint: "usage: xcode-agent ui tap <x> <y> | --id <accessibility-id> | --label <text> [--bundle-id <id>] [--simulator <udid>] [--duration <secs>]",
                      code: ExitCode.usage, ctx)
         }
         var body: [String: Any] = ["x": x, "y": y]

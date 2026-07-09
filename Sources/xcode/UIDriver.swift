@@ -238,7 +238,7 @@ enum DriverTemplates {
     /// Bump whenever any template below changes — invalidates cached driver
     /// builds and running drivers on user machines (CLI version alone isn't
     /// enough: templates can change between RCs of the same version).
-    static let revision = "3"
+    static let revision = "5"
 
     static let tuistConfig = #"""
     import ProjectDescription
@@ -362,16 +362,28 @@ enum DriverTemplates {
                 return ["ok": true]
 
             case ("POST", "/tapElement"):
-                guard let id = req.body["id"] as? String,
-                      let bundleId = req.body["bundleId"] as? String else {
-                    return ["ok": false, "error": "tapElement requires id and bundleId"]
+                let id = req.body["id"] as? String
+                let label = req.body["label"] as? String
+                guard let bundleId = req.body["bundleId"] as? String, id != nil || label != nil else {
+                    return ["ok": false, "error": "tapElement requires bundleId and one of id/label"]
                 }
                 guard let app = foregroundApp(bundleId) else {
                     return ["ok": false, "error": "could not bring \(bundleId) to the foreground"]
                 }
-                let element = app.descendants(matching: .any).matching(identifier: id).firstMatch
+                let query: XCUIElementQuery
+                let needle: String
+                if let id = id {
+                    query = app.descendants(matching: .any).matching(identifier: id)
+                    needle = "id '\(id)'"
+                } else {
+                    // Match by exact accessibility label — reaches controls SwiftUI
+                    // leaves unidentified (segmented Picker segments, alert buttons…).
+                    query = app.descendants(matching: .any).matching(NSPredicate(format: "label == %@", label!))
+                    needle = "label '\(label!)'"
+                }
+                let element = query.firstMatch
                 guard element.waitForExistence(timeout: num("timeout") ?? 5) else {
-                    return ["ok": false, "error": "element '\(id)' not found in \(bundleId)"]
+                    return ["ok": false, "error": "element \(needle) not found in \(bundleId)"]
                 }
                 // A SwiftUI Toggle/switch carries its accessibility id on a full-width
                 // container whose center is the label, not the control. Drill to the
@@ -415,7 +427,7 @@ enum DriverTemplates {
                     return ["ok": false, "error": "could not bring \(bundleId) to the foreground"]
                 }
                 _ = app.descendants(matching: .any).firstMatch.waitForExistence(timeout: num("timeout") ?? 5)
-                return ["ok": true, "elements": [snapshotTree(app)]]
+                return ["ok": true, "elements": [stableSnapshotTree(app)]]
 
             default:
                 return ["ok": false, "error": "unknown endpoint \(req.method) \(req.path)"]
@@ -428,6 +440,28 @@ enum DriverTemplates {
             if app.state != .runningForeground { app.activate() }
             _ = app.wait(for: .runningForeground, timeout: 5)
             return app.state == .runningForeground ? app : nil
+        }
+
+        /// SwiftUI builds an element's accessibility subtree lazily, so a snapshot
+        /// taken the instant the app comes foreground can be collapsed (e.g. a
+        /// Stepper's +/- buttons appear as one anonymous `Other`). Re-snapshot until
+        /// the node count stops growing, bounded so a genuinely small screen is fast.
+        static func stableSnapshotTree(_ element: XCUIElement) -> [String: Any] {
+            func count(_ n: [String: Any]) -> Int {
+                let kids = (n["children"] as? [[String: Any]]) ?? []
+                return 1 + kids.reduce(0) { $0 + count($1) }
+            }
+            var best = snapshotTree(element)
+            var bestCount = count(best)
+            for _ in 0..<4 {
+                Thread.sleep(forTimeInterval: 0.2)
+                let next = snapshotTree(element)
+                let nextCount = count(next)
+                if nextCount <= bestCount { break }
+                best = next
+                bestCount = nextCount
+            }
+            return best
         }
 
         /// Convert an XCUIElementSnapshot into the same shape `ui describe` emits,
