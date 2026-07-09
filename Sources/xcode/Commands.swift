@@ -1405,6 +1405,13 @@ enum UICommand {
         var frameOK = true
         let first = matched.first
 
+        // If an --id was supplied and that element DOES exist but was filtered
+        // out by a label/type/value criterion, "not found" is misleading — the
+        // element is right there. Surface the actual attributes so the real
+        // mismatch (a common one: querying a StaticText by --value, whose text
+        // lives in label) is obvious instead of looking like a missing element.
+        let idPresent: [String: Any]? = idQuery.flatMap { q in flat.first { elementID($0) == q } }
+
         if let ef = expectedFrame, let el = first, let f = elementBounds(el) {
             let tol = 5.0
             func close(_ key: String) -> Bool { abs((f[key] ?? 0) - (ef[key] ?? 0)) < tol }
@@ -1419,12 +1426,28 @@ enum UICommand {
             "element":    first as Any? ?? NSNull(),
         ]
 
+        let mismatchError = idPresent != nil ? "element found but attributes did not match" : "element not found"
+
         if ctx.json {
             Out.printJSON(["ok": ok, "command": "ui verify", "data": data,
-                           "error": ok ? NSNull() : (found ? "frame mismatch" : "element not found") as Any,
+                           "error": ok ? NSNull() : (found ? "frame mismatch" : mismatchError) as Any,
                            "hint": NSNull()])
         } else {
-            if !found {
+            if !found, let el = idPresent {
+                print("✗ element '\(idQuery!)' found, but its attributes did not match")
+                let aLbl = elementLabel(el), aVal = elementValue(el)
+                print("  actual label : \(aLbl.isEmpty ? "(empty)" : aLbl)")
+                print("  actual value : \(aVal.isEmpty ? "(empty)" : aVal)")
+                print("  actual type  : \(elementType(el))")
+                if let q = labelQuery { print("  wanted label : \(q)") }
+                if let q = typeQuery  { print("  wanted type  : \(q)") }
+                if let q = valueQuery {
+                    print("  wanted value : \(q)")
+                    if aVal.isEmpty && !aLbl.isEmpty {
+                        print("  note: this element's text is in its label, not value — try --label")
+                    }
+                }
+            } else if !found {
                 print("✗ element not found")
                 if let q = idQuery    { print("  id    : \(q)") }
                 if let q = labelQuery { print("  label : \(q)") }
