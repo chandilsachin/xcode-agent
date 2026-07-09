@@ -1,0 +1,24 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:xcode-agent}",
+            "name": "Debug xcode-agent",
+            "target": "xcode-agent",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug xcode-agent"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:xcode-agent}",
+            "name": "Release xcode-agent",
+            "target": "xcode-agent",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release xcode-agent"
+        }
+    ]
+}

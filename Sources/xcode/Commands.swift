@@ -51,7 +51,7 @@ let commandRegistry: [CommandSpec] = [
     CommandSpec(name: "ui", summary: "Inspect and interact with a simulator's UI",
                 usage: "xcode-agent ui <describe|verify|tap|swipe|input|button|driver> [--simulator <name|udid>] ...",
                 flags: ["--simulator", "--id", "--label", "--type", "--value", "--frame",
-                        "--bundle-id", "--duration", "--delta", "--json"]),
+                        "--bundle-id", "--duration", "--delta", "--screenshot", "--idb", "--json"]),
 ]
 
 // MARK: - Shared build/test runner (summary-only structured output)
@@ -1163,6 +1163,27 @@ enum UICommand {
         return []
     }
 
+    /// Fetch the accessibility hierarchy from the XCUITest driver for a given
+    /// app. Returns nil when no target app is resolvable (caller falls back to
+    /// idb). The driver returns already-nested elements in `ui describe` shape.
+    static func fetchHierarchyViaDriver(udid: String, bundleIdFlag: String?,
+                                        command: String, _ ctx: Context) -> [[String: Any]]? {
+        guard let bundleId = bundleIdFlag ?? UIDriver.lastLaunchedBundleId(udid: udid),
+              !bundleId.isEmpty else { return nil }
+        let port = UIDriver.ensureRunning(udid: udid, command: command, ctx)
+        guard let response = UIDriver.request(port: port, method: "POST", path: "/hierarchy",
+                                              body: ["bundleId": bundleId], timeout: 30) else {
+            return nil
+        }
+        guard response.ok, let elements = response.payload["elements"] as? [[String: Any]] else {
+            if let err = response.error {
+                Out.stderr("warning: driver hierarchy failed (\(err)); falling back to idb")
+            }
+            return nil
+        }
+        return elements
+    }
+
     static func flatten(_ elements: [[String: Any]]) -> [[String: Any]] {
         var result: [[String: Any]] = []
         for el in elements {
@@ -1242,23 +1263,39 @@ enum UICommand {
 
     static func runDescribe(_ args: [String], _ ctx: Context) {
         requireFullXcode("ui describe", ctx)
-        let idb = requireIDB(ctx)
 
         var simulatorTarget: String?
+        var bundleIdFlag: String?
         var withScreenshot = false
+        var forceIDB = false
         var idx = 0
         while idx < args.count {
             switch args[idx] {
             case "--simulator": idx += 1; if idx < args.count { simulatorTarget = args[idx] }
+            case "--bundle-id": idx += 1; if idx < args.count { bundleIdFlag = args[idx] }
             case "--screenshot": withScreenshot = true
+            case "--idb": forceIDB = true
             default: break
             }
             idx += 1
         }
 
         let udid = RunCommand.findOrBootSimulator(target: simulatorTarget, command: "ui describe", ctx)
-        let flat = fetchHierarchy(udid: udid, idb: idb, ctx)
-        let tree = buildSpatialTree(flat)
+
+        // Prefer the XCUITest driver (works on any Xcode, no idb); fall back to
+        // idb when no target app is known or --idb is passed.
+        let tree: [[String: Any]]
+        let flat: [[String: Any]]
+        if !forceIDB,
+           let driverTree = fetchHierarchyViaDriver(udid: udid, bundleIdFlag: bundleIdFlag,
+                                                    command: "ui describe", ctx) {
+            tree = driverTree
+            flat = flatten(driverTree)
+        } else {
+            let idb = requireIDB(ctx)
+            flat = fetchHierarchy(udid: udid, idb: idb, ctx)
+            tree = buildSpatialTree(flat)
+        }
 
         if withScreenshot {
             let path = "/tmp/xcode-agent-ui-\(udid).png"
@@ -1282,9 +1319,10 @@ enum UICommand {
 
     static func runVerify(_ args: [String], _ ctx: Context) {
         requireFullXcode("ui verify", ctx)
-        let idb = requireIDB(ctx)
 
         var simulatorTarget: String?
+        var bundleIdFlag: String?
+        var forceIDB = false
         var labelQuery: String?
         var typeQuery: String?
         var valueQuery: String?
@@ -1296,6 +1334,10 @@ enum UICommand {
             switch args[idx] {
             case "--simulator":
                 idx += 1; if idx < args.count { simulatorTarget = args[idx] }
+            case "--bundle-id":
+                idx += 1; if idx < args.count { bundleIdFlag = args[idx] }
+            case "--idb":
+                forceIDB = true
             case "--label":
                 idx += 1; if idx < args.count { labelQuery = args[idx] }
             case "--type":
@@ -1327,7 +1369,15 @@ enum UICommand {
         }
 
         let udid = RunCommand.findOrBootSimulator(target: simulatorTarget, command: "ui verify", ctx)
-        let flat = fetchHierarchy(udid: udid, idb: idb, ctx)
+        let flat: [[String: Any]]
+        if !forceIDB,
+           let driverTree = fetchHierarchyViaDriver(udid: udid, bundleIdFlag: bundleIdFlag,
+                                                    command: "ui verify", ctx) {
+            flat = flatten(driverTree)
+        } else {
+            let idb = requireIDB(ctx)
+            flat = fetchHierarchy(udid: udid, idb: idb, ctx)
+        }
 
         let matched = flat.filter { el in
             if let q = idQuery,    elementID(el) != q                                    { return false }

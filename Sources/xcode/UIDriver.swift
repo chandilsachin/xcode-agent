@@ -14,6 +14,10 @@ enum UIDriver {
 
     // MARK: Paths & ports
 
+    /// Bump DriverTemplates.revision whenever the embedded driver sources
+    /// change; this stamp invalidates materialized sources AND running drivers.
+    static var revisionStamp: String { version + "+" + DriverTemplates.revision }
+
     static var baseDir: String { NSHomeDirectory() + "/.xcode-agent/driver" }
     static var srcDir: String { baseDir + "/AgentDriver" }
     static var derivedDataDir: String { baseDir + "/DerivedData" }
@@ -75,7 +79,15 @@ enum UIDriver {
     }
 
     static func isHealthy(port: UInt16) -> Bool {
-        request(port: port, method: "GET", path: "/health", timeout: 2)?.ok == true
+        healthRevision(port: port) != nil
+    }
+
+    /// Revision stamp of the driver currently serving on this port, or nil if
+    /// none is reachable.
+    static func healthRevision(port: UInt16) -> String? {
+        guard let response = request(port: port, method: "GET", path: "/health", timeout: 2),
+              response.ok else { return nil }
+        return (response.payload["revision"] as? String) ?? ""
     }
 
     // MARK: Lifecycle
@@ -84,7 +96,13 @@ enum UIDriver {
     /// Builds and launches on first use (slow); subsequent calls are instant.
     static func ensureRunning(udid: String, command: String, _ ctx: Context) -> UInt16 {
         let port = portFor(udid: udid)
-        if isHealthy(port: port) { return port }
+        if let running = healthRevision(port: port) {
+            if running == revisionStamp { return port }
+            // A driver from an older CLI is still serving; replace it.
+            Out.stderr("Restarting UI driver (was revision \(running), need \(revisionStamp))…")
+            _ = request(port: port, method: "POST", path: "/shutdown", timeout: 5)
+            Thread.sleep(forTimeInterval: 2)
+        }
 
         materializeSourcesIfNeeded(command, ctx)
         generateProjectIfNeeded(command, ctx)
@@ -108,7 +126,7 @@ enum UIDriver {
         let fm = FileManager.default
         let versionMarker = srcDir + "/.cli-version"
         if let stamped = try? String(contentsOfFile: versionMarker, encoding: .utf8),
-           stamped == version { return }
+           stamped == revisionStamp { return }
 
         try? fm.removeItem(atPath: srcDir)
         try? fm.removeItem(atPath: derivedDataDir)
@@ -124,7 +142,7 @@ enum UIDriver {
                 toFile: srcDir + "/HostSources/AgentDriverHostApp.swift", atomically: true, encoding: .utf8)
             try DriverTemplates.driverServer.write(
                 toFile: srcDir + "/UITestSources/AgentDriverTests.swift", atomically: true, encoding: .utf8)
-            try version.write(toFile: versionMarker, atomically: true, encoding: .utf8)
+            try revisionStamp.write(toFile: versionMarker, atomically: true, encoding: .utf8)
         } catch {
             Out.fail(command, error: "could not write driver sources to \(srcDir): \(error.localizedDescription)",
                      code: ExitCode.runtime, ctx)
@@ -193,6 +211,7 @@ enum UIDriver {
         var env = ProcessInfo.processInfo.environment
         env["TEST_RUNNER_AGENT_DRIVER_PORT"] = String(port)
         env["TEST_RUNNER_AGENT_DRIVER_IDLE_TIMEOUT"] = "1800"
+        env["TEST_RUNNER_AGENT_DRIVER_REVISION"] = revisionStamp
         process.environment = env
         process.standardOutput = log ?? FileHandle.nullDevice
         process.standardError = log ?? FileHandle.nullDevice
@@ -215,6 +234,11 @@ enum UIDriver {
 /// Sources written to `~/.xcode-agent/driver/AgentDriver` and built on the
 /// user's machine (UI test bundles can't be pre-built portably).
 enum DriverTemplates {
+
+    /// Bump whenever any template below changes — invalidates cached driver
+    /// builds and running drivers on user machines (CLI version alone isn't
+    /// enough: templates can change between RCs of the same version).
+    static let revision = "2"
 
     static let tuistConfig = #"""
     import ProjectDescription
@@ -286,8 +310,9 @@ enum DriverTemplates {
             let env = ProcessInfo.processInfo.environment
             let port = UInt16(env["AGENT_DRIVER_PORT"] ?? "") ?? 8265
             let idleTimeout = TimeInterval(env["AGENT_DRIVER_IDLE_TIMEOUT"] ?? "") ?? 1800
+            let revision = env["AGENT_DRIVER_REVISION"] ?? ""
 
-            let server = DriverServer(port: port)
+            let server = DriverServer(port: port, revision: revision)
             try server.start()
             var lastActivity = Date()
 
@@ -341,7 +366,9 @@ enum DriverTemplates {
                       let bundleId = req.body["bundleId"] as? String else {
                     return ["ok": false, "error": "tapElement requires id and bundleId"]
                 }
-                let app = XCUIApplication(bundleIdentifier: bundleId)
+                guard let app = foregroundApp(bundleId) else {
+                    return ["ok": false, "error": "could not bring \(bundleId) to the foreground"]
+                }
                 let element = app.descendants(matching: .any).matching(identifier: id).firstMatch
                 guard element.waitForExistence(timeout: num("timeout") ?? 5) else {
                     return ["ok": false, "error": "element '\(id)' not found in \(bundleId)"]
@@ -354,9 +381,8 @@ enum DriverTemplates {
                       let bundleId = req.body["bundleId"] as? String else {
                     return ["ok": false, "error": "input requires text and bundleId"]
                 }
-                let app = XCUIApplication(bundleIdentifier: bundleId)
-                guard app.state == .runningForeground else {
-                    return ["ok": false, "error": "app \(bundleId) is not frontmost (state \(app.state.rawValue))"]
+                guard let app = foregroundApp(bundleId) else {
+                    return ["ok": false, "error": "could not bring \(bundleId) to the foreground"]
                 }
                 app.typeText(text)
                 return ["ok": true]
@@ -373,9 +399,68 @@ enum DriverTemplates {
                     return ["ok": false, "error": "button '\(name)' is not supported by the xcuitest backend (only: home)"]
                 }
 
+            case ("POST", "/hierarchy"):
+                guard let bundleId = req.body["bundleId"] as? String else {
+                    return ["ok": false, "error": "hierarchy requires bundleId"]
+                }
+                guard let app = foregroundApp(bundleId) else {
+                    return ["ok": false, "error": "could not bring \(bundleId) to the foreground"]
+                }
+                _ = app.descendants(matching: .any).firstMatch.waitForExistence(timeout: num("timeout") ?? 5)
+                return ["ok": true, "elements": [snapshotTree(app)]]
+
             default:
                 return ["ok": false, "error": "unknown endpoint \(req.method) \(req.path)"]
             }
+        }
+
+        /// Activate `bundleId` and return its XCUIApplication once frontmost.
+        static func foregroundApp(_ bundleId: String) -> XCUIApplication? {
+            let app = XCUIApplication(bundleIdentifier: bundleId)
+            if app.state != .runningForeground { app.activate() }
+            _ = app.wait(for: .runningForeground, timeout: 5)
+            return app.state == .runningForeground ? app : nil
+        }
+
+        /// Convert an XCUIElementSnapshot into the same shape `ui describe` emits,
+        /// so the CLI can reuse its existing tree renderer and JSON envelope.
+        static func snapshotTree(_ element: XCUIElement) -> [String: Any] {
+            func typeName(_ t: XCUIElement.ElementType) -> String {
+                // Human-readable role names matching accessibility conventions.
+                switch t {
+                case .button: return "Button"
+                case .staticText: return "StaticText"
+                case .textField: return "TextField"
+                case .secureTextField: return "SecureTextField"
+                case .image: return "Image"
+                case .cell: return "Cell"
+                case .navigationBar: return "NavigationBar"
+                case .switch: return "Switch"
+                case .slider: return "Slider"
+                case .scrollView: return "ScrollView"
+                case .collectionView: return "CollectionView"
+                case .table: return "Table"
+                case .other: return "Other"
+                case .window: return "Window"
+                case .application: return "Application"
+                default: return "Element"
+                }
+            }
+            func node(_ s: XCUIElementSnapshot) -> [String: Any] {
+                let f = s.frame
+                var dict: [String: Any] = [
+                    "type": typeName(s.elementType),
+                    "AXLabel": s.label,
+                    "AXUniqueId": s.identifier,
+                    "frame": ["x": Double(f.origin.x), "y": Double(f.origin.y),
+                              "width": Double(f.size.width), "height": Double(f.size.height)],
+                ]
+                if let v = s.value as? String { dict["AXValue"] = v }
+                dict["children"] = s.children.map { node($0) }
+                return dict
+            }
+            if let snapshot = try? element.snapshot() { return node(snapshot) }
+            return ["type": "Application", "AXLabel": "", "AXUniqueId": "", "children": []]
         }
     }
 
@@ -387,13 +472,17 @@ enum DriverTemplates {
         struct Job { let request: Request; let respond: ([String: Any]) -> Void }
 
         private let port: UInt16
+        private let revision: String
         private var listener: NWListener?
         private let queue = DispatchQueue(label: "agent-driver.server")
         private let lock = NSLock()
         private var jobs: [Job] = []
         private var shutdown = false
 
-        init(port: UInt16) { self.port = port }
+        init(port: UInt16, revision: String) {
+            self.port = port
+            self.revision = revision
+        }
 
         var shutdownRequested: Bool {
             lock.lock(); defer { lock.unlock() }
@@ -443,7 +532,7 @@ enum DriverTemplates {
         private func dispatch(_ request: Request, _ conn: NWConnection) {
             switch request.path {
             case "/health":
-                Self.send(conn, ["ok": true, "service": "agent-driver"])
+                Self.send(conn, ["ok": true, "service": "agent-driver", "revision": revision])
             case "/shutdown":
                 lock.lock(); shutdown = true; lock.unlock()
                 Self.send(conn, ["ok": true])
