@@ -49,9 +49,10 @@ let commandRegistry: [CommandSpec] = [
     CommandSpec(name: "docs", summary: "Knowledge-base pointers for a query",
                 usage: "xcode-agent docs <query>", flags: ["--json"]),
     CommandSpec(name: "ui", summary: "Inspect and interact with a simulator's UI",
-                usage: "xcode-agent ui <describe|verify|tap|swipe|input|button|driver> [--simulator <name|udid>] ...",
-                flags: ["--simulator", "--id", "--label", "--type", "--value", "--frame",
-                        "--bundle-id", "--exact", "--duration", "--delta", "--screenshot", "--idb", "--json"]),
+                usage: "xcode-agent ui <describe|verify|tap|swipe|scroll|input|button|driver> [--simulator <name|udid>] ...",
+                flags: ["--simulator", "--id", "--label", "--to", "--type", "--value", "--frame",
+                        "--bundle-id", "--exact", "--duration", "--delta", "--direction", "--max-swipes",
+                        "--screenshot", "--idb", "--json"]),
 ]
 
 // MARK: - Shared build/test runner (summary-only structured output)
@@ -1251,12 +1252,13 @@ enum UICommand {
         case "verify":   runVerify(rest, ctx)
         case "tap":      runTap(rest, ctx)
         case "swipe":    runSwipe(rest, ctx)
+        case "scroll":   runScroll(rest, ctx)
         case "input":    runInput(rest, ctx)
         case "button":   runButton(rest, ctx)
         case "driver":   runDriver(rest, ctx)
         default:
             Out.fail("ui", error: "unknown action '\(action)'",
-                     hint: "use: describe | verify | tap | swipe | input | button | driver",
+                     hint: "use: describe | verify | tap | swipe | scroll | input | button | driver",
                      code: ExitCode.usage, ctx)
         }
     }
@@ -1564,6 +1566,47 @@ enum UICommand {
                      body: body,
                      data: ["x1": x1, "y1": y1, "x2": x2, "y2": y2, "simulatorUDID": udid],
                      successText: "✓ swiped (\(Int(x1)),\(Int(y1))) → (\(Int(x2)),\(Int(y2)))", ctx)
+    }
+
+    static func runScroll(_ args: [String], _ ctx: Context) {
+        requireFullXcode("ui scroll", ctx)
+        var simulatorTarget: String?
+        var elementID: String?
+        var elementLabel: String?
+        var bundleIDFlag: String?
+        var direction: String?
+        var maxSwipes: Int?
+        var idx = 0
+        while idx < args.count {
+            switch args[idx] {
+            case "--simulator":  idx += 1; if idx < args.count { simulatorTarget = args[idx] }
+            case "--to", "--id": idx += 1; if idx < args.count { elementID = args[idx] }
+            case "--label":      idx += 1; if idx < args.count { elementLabel = args[idx] }
+            case "--bundle-id":  idx += 1; if idx < args.count { bundleIDFlag = args[idx] }
+            case "--direction":  idx += 1; if idx < args.count { direction = args[idx] }
+            case "--max-swipes": idx += 1; if idx < args.count { maxSwipes = Int(args[idx]) }
+            default: break
+            }
+            idx += 1
+        }
+        guard elementID != nil || elementLabel != nil else {
+            Out.fail("ui scroll", error: "missing target",
+                     hint: "usage: xcode-agent ui scroll --to <accessibility-id> | --label <text> [--direction up|down|left|right] [--max-swipes <n>] [--bundle-id <id>] [--simulator <udid>]",
+                     code: ExitCode.usage, ctx)
+        }
+
+        let udid = RunCommand.findOrBootSimulator(target: simulatorTarget, command: "ui scroll", ctx)
+        let bundleId = resolveBundleId(flag: bundleIDFlag, udid: udid, command: "ui scroll", ctx)
+        var body: [String: Any] = ["bundleId": bundleId]
+        if let elementID { body["id"] = elementID }
+        if let elementLabel { body["label"] = elementLabel }
+        if let direction { body["direction"] = direction }
+        if let maxSwipes { body["maxSwipes"] = maxSwipes }
+        let targetDesc = elementID.map { "'\($0)'" } ?? "labeled '\(elementLabel!)'"
+        driverAction(command: "ui scroll", udid: udid, path: "/scroll",
+                     body: body,
+                     data: ["id": elementID as Any, "label": elementLabel as Any, "bundleId": bundleId, "simulatorUDID": udid],
+                     successText: "✓ scrolled to element \(targetDesc)", ctx)
     }
 
     static func runInput(_ args: [String], _ ctx: Context) {

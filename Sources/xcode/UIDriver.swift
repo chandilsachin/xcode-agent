@@ -238,7 +238,7 @@ enum DriverTemplates {
     /// Bump whenever any template below changes — invalidates cached driver
     /// builds and running drivers on user machines (CLI version alone isn't
     /// enough: templates can change between RCs of the same version).
-    static let revision = "5"
+    static let revision = "6"
 
     static let tuistConfig = #"""
     import ProjectDescription
@@ -395,6 +395,51 @@ enum DriverTemplates {
                 }
                 target.tap()
                 return ["ok": true]
+
+            case ("POST", "/scroll"):
+                let id = req.body["id"] as? String
+                let label = req.body["label"] as? String
+                guard let bundleId = req.body["bundleId"] as? String, id != nil || label != nil else {
+                    return ["ok": false, "error": "scroll requires bundleId and one of id/label"]
+                }
+                guard let app = foregroundApp(bundleId) else {
+                    return ["ok": false, "error": "could not bring \(bundleId) to the foreground"]
+                }
+                let query: XCUIElementQuery
+                let needle: String
+                if let id = id {
+                    query = app.descendants(matching: .any).matching(identifier: id)
+                    needle = "id '\(id)'"
+                } else {
+                    query = app.descendants(matching: .any).matching(NSPredicate(format: "label == %@", label!))
+                    needle = "label '\(label!)'"
+                }
+                let element = query.firstMatch
+                guard element.waitForExistence(timeout: num("timeout") ?? 5) else {
+                    return ["ok": false, "error": "element \(needle) not found in \(bundleId)"]
+                }
+                // Drive the content with real finger drags — one swipe per page —
+                // instead of XCUITest's implicit auto-scroll, so it reads exactly
+                // like a user thumbing through the screen and works even where the
+                // built-in scroll-into-view heuristic gives up. `isHittable` is the
+                // stop condition: true only once the element is on-screen *and*
+                // interactable, which is what a user would actually see.
+                let direction = (req.body["direction"] as? String)?.lowercased() ?? "up"
+                let maxSwipes = Int(num("maxSwipes") ?? 12)
+                var swipes = 0
+                while !element.isHittable && swipes < maxSwipes {
+                    switch direction {
+                    case "down":  app.swipeDown()
+                    case "left":  app.swipeLeft()
+                    case "right": app.swipeRight()
+                    default:      app.swipeUp()
+                    }
+                    swipes += 1
+                }
+                guard element.isHittable else {
+                    return ["ok": false, "error": "swiped \(direction) \(swipes)x but \(needle) never became visible (try --direction or a larger --max-swipes)"]
+                }
+                return ["ok": true, "swipes": swipes]
 
             case ("POST", "/input"):
                 guard let text = req.body["text"] as? String,
