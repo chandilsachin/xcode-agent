@@ -52,7 +52,7 @@ let commandRegistry: [CommandSpec] = [
                 usage: "xcode-agent ui <describe|verify|tap|swipe|scroll|adjust|input|button|driver> [--simulator <name|udid>] ...",
                 flags: ["--simulator", "--id", "--label", "--to", "--type", "--value", "--frame",
                         "--bundle-id", "--exact", "--duration", "--delta", "--direction", "--max-swipes",
-                        "--position", "--screenshot", "--idb", "--json"]),
+                        "--position", "--index", "--clear", "--screenshot", "--idb", "--json"]),
 ]
 
 // MARK: - Shared build/test runner (summary-only structured output)
@@ -1514,6 +1514,7 @@ enum UICommand {
         var elementID: String?
         var elementLabel: String?
         var bundleIDFlag: String?
+        var indexSel: Int?
         var positional: [String] = []
         var idx = 0
         while idx < args.count {
@@ -1523,9 +1524,20 @@ enum UICommand {
             case "--id":        idx += 1; if idx < args.count { elementID = args[idx] }
             case "--label":     idx += 1; if idx < args.count { elementLabel = args[idx] }
             case "--bundle-id": idx += 1; if idx < args.count { bundleIDFlag = args[idx] }
+            case "--index":     idx += 1; if idx < args.count { indexSel = Int(args[idx]) }
             default: positional.append(args[idx])
             }
             idx += 1
+        }
+
+        // Exactly one targeting mode — coords, --id, or --label. Silently
+        // preferring one over another (the old behaviour) hides mistakes.
+        let hasCoords = positional.count >= 2
+        let modes = [elementID != nil, elementLabel != nil, hasCoords].filter { $0 }.count
+        if modes > 1 {
+            Out.fail("ui tap", error: "ambiguous target — use exactly one of <x> <y>, --id, or --label",
+                     hint: "you passed more than one; drop the extras",
+                     code: ExitCode.usage, ctx)
         }
 
         let udid = RunCommand.findOrBootSimulator(target: simulatorTarget, command: "ui tap", ctx)
@@ -1534,6 +1546,7 @@ enum UICommand {
             let bundleId = resolveBundleId(flag: bundleIDFlag, udid: udid, command: "ui tap", ctx)
             var body: [String: Any] = ["id": elementID, "bundleId": bundleId]
             if let duration { body["duration"] = duration }
+            if let indexSel { body["index"] = indexSel }
             let verb = duration != nil ? "long-pressed" : "tapped"
             driverAction(command: "ui tap", udid: udid, path: "/tapElement",
                          body: body,
@@ -1545,6 +1558,7 @@ enum UICommand {
             let bundleId = resolveBundleId(flag: bundleIDFlag, udid: udid, command: "ui tap", ctx)
             var body: [String: Any] = ["label": elementLabel, "bundleId": bundleId]
             if let duration { body["duration"] = duration }
+            if let indexSel { body["index"] = indexSel }
             let verb = duration != nil ? "long-pressed" : "tapped"
             driverAction(command: "ui tap", udid: udid, path: "/tapElement",
                          body: body,
@@ -1556,11 +1570,16 @@ enum UICommand {
               let x = Double(positional[0]),
               let y = Double(positional[1]) else {
             Out.fail("ui tap", error: "missing coordinates, --id, or --label",
-                     hint: "usage: xcode-agent ui tap <x> <y> | --id <accessibility-id> | --label <text> [--bundle-id <id>] [--simulator <udid>] [--duration <secs>]",
+                     hint: "usage: xcode-agent ui tap <x> <y> | --id <accessibility-id> | --label <text> [--index <n>] [--bundle-id <id>] [--simulator <udid>] [--duration <secs>]",
                      code: ExitCode.usage, ctx)
         }
         var body: [String: Any] = ["x": x, "y": y]
         if let duration { body["duration"] = duration }
+        // Activate the target app (explicit flag, else last-launched) so a
+        // coordinate tap lands on it — consistent with the element commands.
+        if let bid = bundleIDFlag ?? UIDriver.lastLaunchedBundleId(udid: udid), !bid.isEmpty {
+            body["bundleId"] = bid
+        }
         driverAction(command: "ui tap", udid: udid, path: "/tap",
                      body: body,
                      data: ["x": x, "y": y, "simulatorUDID": udid],
@@ -1571,12 +1590,14 @@ enum UICommand {
         requireFullXcode("ui swipe", ctx)
         var simulatorTarget: String?
         var duration: Double?
+        var bundleIDFlag: String?
         var positional: [String] = []
         var idx = 0
         while idx < args.count {
             switch args[idx] {
             case "--simulator": idx += 1; if idx < args.count { simulatorTarget = args[idx] }
             case "--duration":  idx += 1; if idx < args.count { duration = Double(args[idx]) }
+            case "--bundle-id": idx += 1; if idx < args.count { bundleIDFlag = args[idx] }
             case "--delta":     idx += 1 // accepted for back-compat; the xcuitest backend ignores it
             default: positional.append(args[idx])
             }
@@ -1586,12 +1607,17 @@ enum UICommand {
               let x1 = Double(positional[0]), let y1 = Double(positional[1]),
               let x2 = Double(positional[2]), let y2 = Double(positional[3]) else {
             Out.fail("ui swipe", error: "missing coordinates",
-                     hint: "usage: xcode-agent ui swipe <x1> <y1> <x2> <y2> [--simulator <udid>] [--duration <secs>]",
+                     hint: "usage: xcode-agent ui swipe <x1> <y1> <x2> <y2> [--bundle-id <id>] [--simulator <udid>] [--duration <secs>]",
                      code: ExitCode.usage, ctx)
         }
         let udid = RunCommand.findOrBootSimulator(target: simulatorTarget, command: "ui swipe", ctx)
         var body: [String: Any] = ["x1": x1, "y1": y1, "x2": x2, "y2": y2]
         if let duration { body["duration"] = duration }
+        // Activate the target app (explicit flag, else last-launched) so the
+        // coordinate swipe lands on it — consistent with the element commands.
+        if let bid = bundleIDFlag ?? UIDriver.lastLaunchedBundleId(udid: udid), !bid.isEmpty {
+            body["bundleId"] = bid
+        }
         driverAction(command: "ui swipe", udid: udid, path: "/swipe",
                      body: body,
                      data: ["x1": x1, "y1": y1, "x2": x2, "y2": y2, "simulatorUDID": udid],
@@ -1606,6 +1632,7 @@ enum UICommand {
         var bundleIDFlag: String?
         var direction: String?
         var maxSwipes: Int?
+        var indexSel: Int?
         var idx = 0
         while idx < args.count {
             switch args[idx] {
@@ -1615,13 +1642,18 @@ enum UICommand {
             case "--bundle-id":  idx += 1; if idx < args.count { bundleIDFlag = args[idx] }
             case "--direction":  idx += 1; if idx < args.count { direction = args[idx] }
             case "--max-swipes": idx += 1; if idx < args.count { maxSwipes = Int(args[idx]) }
+            case "--index":      idx += 1; if idx < args.count { indexSel = Int(args[idx]) }
             default: break
             }
             idx += 1
         }
         guard elementID != nil || elementLabel != nil else {
             Out.fail("ui scroll", error: "missing target",
-                     hint: "usage: xcode-agent ui scroll --to <accessibility-id> | --label <text> [--direction up|down|left|right] [--max-swipes <n>] [--bundle-id <id>] [--simulator <udid>]",
+                     hint: "usage: xcode-agent ui scroll --to <accessibility-id> | --label <text> [--index <n>] [--direction up|down|left|right] [--max-swipes <n>] [--bundle-id <id>] [--simulator <udid>]",
+                     code: ExitCode.usage, ctx)
+        }
+        if elementID != nil && elementLabel != nil {
+            Out.fail("ui scroll", error: "ambiguous target — use either --to/--id or --label, not both",
                      code: ExitCode.usage, ctx)
         }
 
@@ -1632,6 +1664,7 @@ enum UICommand {
         if let elementLabel { body["label"] = elementLabel }
         if let direction { body["direction"] = direction }
         if let maxSwipes { body["maxSwipes"] = maxSwipes }
+        if let indexSel { body["index"] = indexSel }
         let targetDesc = elementID.map { "'\($0)'" } ?? "labeled '\(elementLabel!)'"
         driverAction(command: "ui scroll", udid: udid, path: "/scroll",
                      body: body,
@@ -1646,6 +1679,7 @@ enum UICommand {
         var elementLabel: String?
         var bundleIDFlag: String?
         var position: Double?
+        var indexSel: Int?
         var idx = 0
         while idx < args.count {
             switch args[idx] {
@@ -1654,13 +1688,18 @@ enum UICommand {
             case "--label":      idx += 1; if idx < args.count { elementLabel = args[idx] }
             case "--bundle-id":  idx += 1; if idx < args.count { bundleIDFlag = args[idx] }
             case "--position":   idx += 1; if idx < args.count { position = Double(args[idx]) }
+            case "--index":      idx += 1; if idx < args.count { indexSel = Int(args[idx]) }
             default: break
             }
             idx += 1
         }
         guard let position, elementID != nil || elementLabel != nil else {
             Out.fail("ui adjust", error: "missing --position and/or target",
-                     hint: "usage: xcode-agent ui adjust --id <accessibility-id> | --label <text> --position <0.0-1.0> [--bundle-id <id>] [--simulator <udid>]",
+                     hint: "usage: xcode-agent ui adjust --id <accessibility-id> | --label <text> --position <0.0-1.0> [--index <n>] [--bundle-id <id>] [--simulator <udid>]",
+                     code: ExitCode.usage, ctx)
+        }
+        if elementID != nil && elementLabel != nil {
+            Out.fail("ui adjust", error: "ambiguous target — use either --id or --label, not both",
                      code: ExitCode.usage, ctx)
         }
 
@@ -1669,6 +1708,7 @@ enum UICommand {
         var body: [String: Any] = ["bundleId": bundleId, "position": position]
         if let elementID { body["id"] = elementID }
         if let elementLabel { body["label"] = elementLabel }
+        if let indexSel { body["index"] = indexSel }
         let targetDesc = elementID.map { "'\($0)'" } ?? "labeled '\(elementLabel!)'"
         driverAction(command: "ui adjust", udid: udid, path: "/adjustSlider",
                      body: body,
@@ -1680,27 +1720,54 @@ enum UICommand {
         requireFullXcode("ui input", ctx)
         var simulatorTarget: String?
         var bundleIDFlag: String?
+        var elementID: String?
+        var elementLabel: String?
+        var clear = false
+        var indexSel: Int?
         var positional: [String] = []
         var idx = 0
         while idx < args.count {
             switch args[idx] {
             case "--simulator": idx += 1; if idx < args.count { simulatorTarget = args[idx] }
             case "--bundle-id": idx += 1; if idx < args.count { bundleIDFlag = args[idx] }
+            case "--id":        idx += 1; if idx < args.count { elementID = args[idx] }
+            case "--label":     idx += 1; if idx < args.count { elementLabel = args[idx] }
+            case "--index":     idx += 1; if idx < args.count { indexSel = Int(args[idx]) }
+            case "--clear":     clear = true
             default: positional.append(args[idx])
             }
             idx += 1
         }
-        guard let text = positional.first, !text.isEmpty else {
+        let text = positional.first ?? ""
+        // Text is optional only when --clear is set (clear the field, type nothing).
+        guard !text.isEmpty || clear else {
             Out.fail("ui input", error: "missing text argument",
-                     hint: "usage: xcode-agent ui input <text> [--bundle-id <id>] [--simulator <udid>]",
+                     hint: "usage: xcode-agent ui input <text> [--id <id> | --label <text>] [--clear] [--index <n>] [--bundle-id <id>] [--simulator <udid>]",
+                     code: ExitCode.usage, ctx)
+        }
+        if elementID != nil && elementLabel != nil {
+            Out.fail("ui input", error: "ambiguous target — use either --id or --label, not both",
+                     code: ExitCode.usage, ctx)
+        }
+        if clear && elementID == nil && elementLabel == nil {
+            Out.fail("ui input", error: "--clear requires --id or --label to target a field",
+                     hint: "app-level typing can't safely clear an unknown field",
                      code: ExitCode.usage, ctx)
         }
         let udid = RunCommand.findOrBootSimulator(target: simulatorTarget, command: "ui input", ctx)
         let bundleId = resolveBundleId(flag: bundleIDFlag, udid: udid, command: "ui input", ctx)
+        var body: [String: Any] = ["text": text, "bundleId": bundleId]
+        if let elementID { body["id"] = elementID }
+        if let elementLabel { body["label"] = elementLabel }
+        if let indexSel { body["index"] = indexSel }
+        if clear { body["clear"] = true }
+        let target = elementID.map { " into '\($0)'" } ?? elementLabel.map { " into '\($0)'" } ?? ""
+        let successText = text.isEmpty ? "✓ cleared field\(target)"
+                                       : "✓ typed\(target): \(text)"
         driverAction(command: "ui input", udid: udid, path: "/input",
-                     body: ["text": text, "bundleId": bundleId],
+                     body: body,
                      data: ["text": text, "bundleId": bundleId, "simulatorUDID": udid],
-                     successText: "✓ typed: \(text)", ctx)
+                     successText: successText, ctx)
     }
 
     static func runButton(_ args: [String], _ ctx: Context) {

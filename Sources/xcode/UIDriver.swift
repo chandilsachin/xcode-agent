@@ -238,7 +238,7 @@ enum DriverTemplates {
     /// Bump whenever any template below changes — invalidates cached driver
     /// builds and running drivers on user machines (CLI version alone isn't
     /// enough: templates can change between RCs of the same version).
-    static let revision = "8"
+    static let revision = "10"
 
     static let tuistConfig = #"""
     import ProjectDescription
@@ -332,7 +332,18 @@ enum DriverTemplates {
         static let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
 
         static func screenPoint(_ x: Double, _ y: Double) -> XCUICoordinate {
-            springboard.coordinate(withNormalizedOffset: CGVector(dx: 0, dy: 0))
+            pointIn(springboard, x, y)
+        }
+
+        /// A coordinate at absolute screen offset (x, y) anchored to `app`.
+        /// Anchoring to the target app (rather than springboard) matters for
+        /// coordinate gestures: XCUICoordinate.tap() implicitly activates the
+        /// coordinate's owning app, so a springboard-anchored tap would yank
+        /// springboard back to the foreground and miss a just-activated app.
+        /// For a full-screen iOS app the frame origin is (0,0), so the absolute
+        /// screen point is identical — only the owning app differs.
+        static func pointIn(_ app: XCUIApplication, _ x: Double, _ y: Double) -> XCUICoordinate {
+            app.coordinate(withNormalizedOffset: CGVector(dx: 0, dy: 0))
                 .withOffset(CGVector(dx: x, dy: y))
         }
 
@@ -345,10 +356,20 @@ enum DriverTemplates {
                 guard let x = num("x"), let y = num("y") else {
                     return ["ok": false, "error": "tap requires numeric x and y"]
                 }
+                // Bring the target app foreground first (when known) and anchor the
+                // coordinate to it, so the tap lands on it rather than whatever
+                // happens to be frontmost — matching the element-targeted commands.
+                // Anchoring to the app keeps XCUICoordinate.tap() from re-activating
+                // springboard and undoing the foregrounding.
+                var tapAnchor = springboard
+                if let bundleId = req.body["bundleId"] as? String, !bundleId.isEmpty,
+                   let app = foregroundApp(bundleId) {
+                    tapAnchor = app
+                }
                 if let duration = num("duration"), duration > 0 {
-                    screenPoint(x, y).press(forDuration: duration)
+                    pointIn(tapAnchor, x, y).press(forDuration: duration)
                 } else {
-                    screenPoint(x, y).tap()
+                    pointIn(tapAnchor, x, y).tap()
                 }
                 return ["ok": true]
 
@@ -357,8 +378,14 @@ enum DriverTemplates {
                       let x2 = num("x2"), let y2 = num("y2") else {
                     return ["ok": false, "error": "swipe requires numeric x1 y1 x2 y2"]
                 }
+                var swipeAnchor = springboard
+                if let bundleId = req.body["bundleId"] as? String, !bundleId.isEmpty,
+                   let app = foregroundApp(bundleId) {
+                    swipeAnchor = app
+                }
                 let duration = num("duration") ?? 0.1
-                screenPoint(x1, y1).press(forDuration: duration, thenDragTo: screenPoint(x2, y2))
+                pointIn(swipeAnchor, x1, y1)
+                    .press(forDuration: duration, thenDragTo: pointIn(swipeAnchor, x2, y2))
                 return ["ok": true]
 
             case ("POST", "/tapElement"):
@@ -381,9 +408,12 @@ enum DriverTemplates {
                     query = app.descendants(matching: .any).matching(NSPredicate(format: "label == %@", label!))
                     needle = "label '\(label!)'"
                 }
-                let element = query.firstMatch
+                // --index picks the Nth match when a label/type is shared by
+                // several elements; 0 (the default) keeps the fast firstMatch path.
+                let sel = Int(num("index") ?? 0)
+                let element = sel <= 0 ? query.firstMatch : query.element(boundBy: sel)
                 guard element.waitForExistence(timeout: num("timeout") ?? 5) else {
-                    return ["ok": false, "error": "element \(needle) not found in \(bundleId)"]
+                    return ["ok": false, "error": "element \(needle)\(sel > 0 ? " [index \(sel)]" : "") not found in \(bundleId)"]
                 }
                 // A SwiftUI Toggle/switch carries its accessibility id on a full-width
                 // container whose center is the label, not the control. Drill to the
@@ -421,9 +451,10 @@ enum DriverTemplates {
                     query = app.descendants(matching: .any).matching(NSPredicate(format: "label == %@", label!))
                     needle = "label '\(label!)'"
                 }
-                let element = query.firstMatch
+                let sel = Int(num("index") ?? 0)
+                let element = sel <= 0 ? query.firstMatch : query.element(boundBy: sel)
                 guard element.waitForExistence(timeout: num("timeout") ?? 5) else {
-                    return ["ok": false, "error": "element \(needle) not found in \(bundleId)"]
+                    return ["ok": false, "error": "element \(needle)\(sel > 0 ? " [index \(sel)]" : "") not found in \(bundleId)"]
                 }
                 // The id may sit on a container; the actual slider is that element
                 // or its innermost .slider descendant. adjust() drags the thumb the
@@ -455,9 +486,10 @@ enum DriverTemplates {
                     query = app.descendants(matching: .any).matching(NSPredicate(format: "label == %@", label!))
                     needle = "label '\(label!)'"
                 }
-                let element = query.firstMatch
+                let sel = Int(num("index") ?? 0)
+                let element = sel <= 0 ? query.firstMatch : query.element(boundBy: sel)
                 guard element.waitForExistence(timeout: num("timeout") ?? 5) else {
-                    return ["ok": false, "error": "element \(needle) not found in \(bundleId)"]
+                    return ["ok": false, "error": "element \(needle)\(sel > 0 ? " [index \(sel)]" : "") not found in \(bundleId)"]
                 }
                 // Drive the content with real finger drags — one swipe per page —
                 // instead of XCUITest's implicit auto-scroll, so it reads exactly
@@ -490,7 +522,44 @@ enum DriverTemplates {
                 guard let app = foregroundApp(bundleId) else {
                     return ["ok": false, "error": "could not bring \(bundleId) to the foreground"]
                 }
-                app.typeText(text)
+                let id = req.body["id"] as? String
+                let label = req.body["label"] as? String
+                let clear = (req.body["clear"] as? Bool) ?? false
+                if id != nil || label != nil {
+                    // Target a specific field: focus it, optionally wipe it, then type
+                    // into it — instead of the bare app.typeText() that assumes some
+                    // field already has focus and always appends.
+                    let query: XCUIElementQuery
+                    let needle: String
+                    if let id = id {
+                        query = app.descendants(matching: .any).matching(identifier: id)
+                        needle = "id '\(id)'"
+                    } else {
+                        query = app.descendants(matching: .any).matching(NSPredicate(format: "label == %@", label!))
+                        needle = "label '\(label!)'"
+                    }
+                    let sel = Int(num("index") ?? 0)
+                    let element = sel <= 0 ? query.firstMatch : query.element(boundBy: sel)
+                    guard element.waitForExistence(timeout: num("timeout") ?? 5) else {
+                        return ["ok": false, "error": "field \(needle)\(sel > 0 ? " [index \(sel)]" : "") not found in \(bundleId)"]
+                    }
+                    element.tap()
+                    if clear {
+                        // A field's `value` is its current text, but for an empty field
+                        // it's the placeholder — deleting that many chars on an already
+                        // empty field is a harmless no-op, so this is safe either way.
+                        if let existing = element.value as? String, !existing.isEmpty {
+                            let deletes = String(repeating: XCUIKeyboardKey.delete.rawValue, count: existing.count)
+                            element.typeText(deletes)
+                        }
+                    }
+                    element.typeText(text)
+                } else {
+                    if clear {
+                        return ["ok": false, "error": "--clear requires --id or --label to target a field"]
+                    }
+                    app.typeText(text)
+                }
                 return ["ok": true]
 
             case ("POST", "/button"):
